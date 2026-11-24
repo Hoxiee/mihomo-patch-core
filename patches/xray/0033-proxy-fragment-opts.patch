@@ -1,8 +1,8 @@
 mihomo-patch-core: xray/0033-proxy-fragment-opts
-Source: ClashFest core patch 0033 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0033 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
-index 235e108..050e244 100644
+index d6942ba..dfd37bf 100644
 --- a/adapter/outbound/base.go
 +++ b/adapter/outbound/base.go
 @@ -12,6 +12,7 @@ import (
@@ -13,7 +13,7 @@ index 235e108..050e244 100644
  	"github.com/metacubex/mihomo/component/proxydialer"
  	"github.com/metacubex/mihomo/component/resolver"
  	C "github.com/metacubex/mihomo/constant"
-@@ -202,6 +203,10 @@ type BasicOption struct {
+@@ -198,6 +199,10 @@ type BasicOption struct {
  	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
  	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
  
@@ -24,7 +24,7 @@ index 235e108..050e244 100644
  	//
  	// The following parameters are used internally, assign value by the structure decoder are disallowed
  	//
-@@ -220,6 +225,10 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
+@@ -215,6 +220,10 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
  			cDialer = dialer.NewDialer(opts...)
  		}
  	}
@@ -78,10 +78,10 @@ index 0000000..02f4fe7
 +	require.True(t, wrapped)
 +}
 diff --git a/adapter/parser.go b/adapter/parser.go
-index b1d9701..14ecfa0 100644
+index f7476cd..adc1d47 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -8,6 +8,7 @@ import (
+@@ -5,6 +5,7 @@ import (
  
  	"github.com/metacubex/mihomo/adapter/outbound"
  	"github.com/metacubex/mihomo/common/structure"
@@ -89,7 +89,7 @@ index b1d9701..14ecfa0 100644
  	C "github.com/metacubex/mihomo/constant"
  )
  
-@@ -18,6 +19,18 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -15,6 +16,18 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		return nil, fmt.Errorf("missing type")
  	}
  

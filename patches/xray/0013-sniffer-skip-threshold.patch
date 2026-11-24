@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0013-sniffer-skip-threshold
-Source: ClashFest core patch 0013 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0013 (GPL-3.0), ported to the core series.
 
 diff --git a/component/sniffer/dispatcher.go b/component/sniffer/dispatcher.go
 index 3f5180e..73926ec 100644
@@ -173,7 +173,7 @@ index 0000000..18f0adf
 +	assert.Error(t, err)
 +}
 diff --git a/config/config.go b/config/config.go
-index 26536f8..bbe796a 100644
+index 5e4de37..244d37e 100644
 --- a/config/config.go
 +++ b/config/config.go
 @@ -384,6 +384,7 @@ type RawSniffer struct {
@@ -184,7 +184,7 @@ index 26536f8..bbe796a 100644
  
  	Sniff map[string]RawSniffingConfig `yaml:"sniff" json:"sniff"`
  }
-@@ -1784,6 +1785,10 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
+@@ -1783,6 +1784,10 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
  		Enable:          snifferRaw.Enable,
  		ForceDnsMapping: snifferRaw.ForceDnsMapping,
  		ParsePureIp:     snifferRaw.ParsePureIp,

@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0037-vless-mux-cool
-Source: ClashFest core patch 0037 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0037 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0037: VLESS mux.cool client (opt-in "mux.cool" block on vless proxies).
 
@@ -888,7 +888,7 @@ index 0000000..b04b4d1
 +	}
 +}
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 75bfcfd..573b1a0 100644
+index 3753bb2..e01da23 100644
 --- a/adapter/outbound/vless.go
 +++ b/adapter/outbound/vless.go
 @@ -301,7 +301,10 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
@@ -976,10 +976,16 @@ index 0000000..4962617
 +	}
 +}
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 14ecfa0..84e4967 100644
+index adc1d47..4f2061c 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -10,6 +10,7 @@ import (
+@@ -2,11 +2,13 @@ package adapter
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/metacubex/mihomo/adapter/outbound"
  	"github.com/metacubex/mihomo/common/structure"
  	"github.com/metacubex/mihomo/component/fragment"
  	C "github.com/metacubex/mihomo/constant"
@@ -987,7 +993,7 @@ index 14ecfa0..84e4967 100644
  )
  
  func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error) {
-@@ -252,6 +253,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -244,6 +246,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		return nil, err
  	}
  
@@ -1001,8 +1007,8 @@ index 14ecfa0..84e4967 100644
  	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
  		muxOption := &outbound.SingMuxOption{}
  		err = decoder.Decode(muxMapping, muxOption)
-@@ -332,6 +340,55 @@ func firstString(mapping map[string]any, keys ...string) string {
- 	return ""
+@@ -266,6 +275,55 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 	return NewProxy(proxy), nil
  }
  
 +// wrapMuxCool applies the opt-in "mux.cool" block of a vless proxy: TCP
@@ -1289,6 +1295,31 @@ index 0000000..3968771
 +		t.Fatalf("error = %v, want xdrive conflict", err)
 +	}
 +}
+diff --git a/go.mod b/go.mod
+index 748fd5e..97ede95 100644
+--- a/go.mod
++++ b/go.mod
+@@ -114,6 +114,7 @@ require (
+ 	github.com/metacubex/hkdf v0.1.0 // indirect
+ 	github.com/metacubex/hpke v0.1.0 // indirect
+ 	github.com/metacubex/jsonv2 v0.0.0-20260721082349-16b4998c8f89 // indirect
++	github.com/metacubex/mldsa v0.1.1
+ 	github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb // indirect
+ 	github.com/metacubex/qpack v0.6.0 // indirect
+ 	github.com/metacubex/tailscale-wireguard-go v0.0.0-20260725073821-e61ab99cede2 // indirect
+diff --git a/go.sum b/go.sum
+index f1b11ab..d8f4ba2 100644
+--- a/go.sum
++++ b/go.sum
+@@ -137,6 +137,8 @@ github.com/metacubex/mhurl v0.1.0 h1:ZdW4Zxe3j3uJ89gNytOazHu6kbHn5owutN/VfXOI8GE
+ github.com/metacubex/mhurl v0.1.0/go.mod h1:2qpQImCbXoUs6GwJrjuEXKelPyoimsIXr07eNKZdS00=
+ github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9 h1:/uFijgwBH3L7m/Ztfd+XpQjMmYgN74FjNTxperKhtdQ=
+ github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9/go.mod h1:+bbwALZI0pbi2auSG5A3ptdpV2DZ2eLObziXo+P7oj0=
++github.com/metacubex/mldsa v0.1.1 h1:Tl9+FeM+AUqL5lG3C8JuoxVGsIINuY0b7XsQgz8jwyU=
++github.com/metacubex/mldsa v0.1.1/go.mod h1:RY6NOdBYmQ17ZRAn5TgXtJCTmuaI3oYdU+XicSGO8Lg=
+ github.com/metacubex/mlkem v0.1.0 h1:wFClitonSFcmipzzQvax75beLQU+D7JuC+VK1RzSL8I=
+ github.com/metacubex/mlkem v0.1.0/go.mod h1:amhaXZVeYNShuy9BILcR7P0gbeo/QLZsnqCdL8U2PDQ=
+ github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb h1:wk6mHYPURSUvWcUv72gNP79oiylFsscBSDPJ6ieV6Iw=
 diff --git a/transport/muxcool/carrier_limiter.go b/transport/muxcool/carrier_limiter.go
 new file mode 100644
 index 0000000..41394ce

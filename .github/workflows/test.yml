@@ -7,11 +7,15 @@ on:
 jobs:
   series:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, flclash, reclash]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: false
-      - name: Apply the series and test the patched packages
-        run: ./tool/test.sh
+      - name: Apply the profile and test the patched packages
+        run: ./tool/test.sh --profile ${{ matrix.profile }}

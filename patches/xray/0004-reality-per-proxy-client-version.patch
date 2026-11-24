@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0004-reality-per-proxy-client-version
-Source: ClashFest core patch 0004 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0004 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/reality.go b/adapter/outbound/reality.go
 index 70c7bc7..f5b536a 100644

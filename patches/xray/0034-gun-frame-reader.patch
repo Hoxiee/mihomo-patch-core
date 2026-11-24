@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0034-gun-frame-reader
-Source: ClashFest core patch 0034 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0034 (GPL-3.0), ported to the core series.
 
 diff --git a/transport/gun/gun.go b/transport/gun/gun.go
 index 39bf21f..586b9b0 100644

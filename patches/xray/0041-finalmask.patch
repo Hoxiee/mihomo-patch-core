@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0041-finalmask
-Source: ClashFest core patch 0041 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0041 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0041: Xray-core finalmask on vless and trojan.
 Ported from Prizrak-Core v1.19.34-r4.
@@ -1155,7 +1155,7 @@ index 0000000..7fba2b7
 +	require.Error(t, checkFinalMaskNetwork(udp, "trojan", "grpc", []string{"h3"}))
 +}
 diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
-index 23a43a1..c5853ad 100644
+index d581e80..6896749 100644
 --- a/adapter/outbound/trojan.go
 +++ b/adapter/outbound/trojan.go
 @@ -13,6 +13,7 @@ import (
@@ -1198,7 +1198,7 @@ index 23a43a1..c5853ad 100644
  }
  
  // DialContext implements C.ProxyAdapter
-@@ -307,6 +317,8 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+@@ -306,6 +316,8 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
  	t.dialer = option.NewDialer(t.DialOptions())
  
  	var err error
@@ -1207,7 +1207,7 @@ index 23a43a1..c5853ad 100644
  	t.echConfig, err = option.ECHOpts.Parse()
  	if err != nil {
  		return nil, err
-@@ -360,7 +372,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+@@ -359,7 +371,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
  
  	if option.Network == "grpc" {
  		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1217,7 +1217,7 @@ index 23a43a1..c5853ad 100644
  				return nil, fmt.Errorf("%s connect error: %s", t.addr, err.Error())
  			}
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 573b1a0..03f2205 100644
+index e01da23..5f39796 100644
 --- a/adapter/outbound/vless.go
 +++ b/adapter/outbound/vless.go
 @@ -17,6 +17,7 @@ import (
@@ -1283,7 +1283,7 @@ index 573b1a0..03f2205 100644
  }
  
  // DialContext implements C.ProxyAdapter
-@@ -550,6 +580,9 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -549,6 +579,9 @@ func NewVless(option VlessOption) (*Vless, error) {
  	}
  	v.dialer = option.NewDialer(v.DialOptions())
  
@@ -1293,7 +1293,7 @@ index 573b1a0..03f2205 100644
  	v.encryption, err = encryption.NewClient(option.Encryption)
  	if err != nil {
  		return nil, err
-@@ -615,7 +648,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -614,7 +647,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  		}
  	case "grpc":
  		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1302,7 +1302,7 @@ index 573b1a0..03f2205 100644
  			if err != nil {
  				return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
  			}
-@@ -719,7 +752,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -718,7 +751,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  		makeTransport := func() http.RoundTripper {
  			return xhttp.NewTransport(
  				func(ctx context.Context) (net.Conn, error) {
@@ -1311,7 +1311,7 @@ index 573b1a0..03f2205 100644
  				},
  				func(ctx context.Context, raw net.Conn, isH2 bool) (net.Conn, error) {
  					return v.streamTLSConn(ctx, raw, isH2)
-@@ -756,11 +789,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -755,11 +788,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  					if err != nil {
  						return nil, err
  					}
@@ -1324,7 +1324,7 @@ index 573b1a0..03f2205 100644
  				},
  				v.option.ALPN,
  				hKeepAlivePeriod,
-@@ -880,7 +909,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -879,7 +908,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  			makeDownloadTransport = func() http.RoundTripper {
  				return xhttp.NewTransport(
  					func(ctx context.Context) (net.Conn, error) {
@@ -1333,7 +1333,7 @@ index 573b1a0..03f2205 100644
  					},
  					func(ctx context.Context, conn net.Conn, isH2 bool) (net.Conn, error) {
  						if downloadTLS {
-@@ -947,11 +976,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -946,11 +975,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  						if err != nil {
  							return nil, err
  						}

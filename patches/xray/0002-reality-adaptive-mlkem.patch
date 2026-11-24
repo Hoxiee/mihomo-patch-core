@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0002-reality-adaptive-mlkem
-Source: ClashFest core patch 0002 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0002 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/reality.go b/component/tls/reality.go
 index aad35f7..561fd76 100644

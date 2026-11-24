@@ -1,5 +1,5 @@
-mihomo-patch-core: compat/0001-finalmask-android-guard
-Adapts ClashFest's finalmask xicmp guard from features.CMFA to the host layer's features.Android.
+mihomo-patch-core: flclash/0002-finalmask-android-guard
+Source: ReClash host adaptation after the FlClash layer; ClashFest 0041 uses features.CMFA in core.
 
 diff --git a/config/finalmask_test.go b/config/finalmask_test.go
 index 742b37d..0205a74 100644

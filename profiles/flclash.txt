@@ -1,0 +1,4 @@
+# Core plus the FlClash host integration and its feature.Android adaptation.
+include core.txt
+flclash/0001-flclash-host-integration.patch
+flclash/0002-finalmask-android-guard.patch

@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0023-reality-pq-browser-hellos
-Source: ClashFest core patch 0023 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0023 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/reality.go b/component/tls/reality.go
 index e8f516f..1ce9849 100644

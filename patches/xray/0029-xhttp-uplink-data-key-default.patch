@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0029-xhttp-uplink-data-key-default
-Source: ClashFest core patch 0029 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0029 (GPL-3.0), ported to the core series.
 
 diff --git a/transport/xhttp/config.go b/transport/xhttp/config.go
 index 855ab29..d595af3 100644

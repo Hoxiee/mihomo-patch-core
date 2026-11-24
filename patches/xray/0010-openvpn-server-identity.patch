@@ -1,8 +1,8 @@
 mihomo-patch-core: xray/0010-openvpn-server-identity
-Source: ClashFest core patch 0010 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0010 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
-index 9f1ecb8..2cd5b88 100644
+index 3c7b1e6..34604ac 100644
 --- a/adapter/outbound/openvpn.go
 +++ b/adapter/outbound/openvpn.go
 @@ -63,6 +63,10 @@ type OpenVPNOption struct {

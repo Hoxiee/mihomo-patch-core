@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0027-reality-mlkem-memo-outcomes
-Source: ClashFest core patch 0027 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0027 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/reality.go b/component/tls/reality.go
 index 0a179e5..68850fe 100644

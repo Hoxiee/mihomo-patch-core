@@ -1,0 +1,14 @@
+# Full ReClash profile: core, FlClash host, then the ReClash product layers.
+include flclash.txt
+reclash/0001-external-adapter-registry.patch
+reclash/0002-proxy-metadata.patch
+reclash/0003-dial-hooks.patch
+reclash/0004-provider-health-scheduling.patch
+reclash/0005-flow-evidence.patch
+reclash/0006-connection-progress.patch
+reclash/0007-policy-hooks.patch
+reclash/0008-site-lock.patch
+reclash/0009-direct-split.patch
+reclash/0010-geo-digest.patch
+reclash/0011-listener-plumbing.patch
+reclash/0012-controller-serve-log.patch

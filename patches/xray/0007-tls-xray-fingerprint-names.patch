@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0007-tls-xray-fingerprint-names
-Source: ClashFest core patch 0007 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0007 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/utls.go b/component/tls/utls.go
 index d48a1ba..6440c70 100644

@@ -1,8 +1,8 @@
 mihomo-patch-core: xray/0003-vless-xdrive
-Source: ClashFest core patch 0003 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0003 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 547f3c9..75bfcfd 100644
+index 1e5b168..3753bb2 100644
 --- a/adapter/outbound/vless.go
 +++ b/adapter/outbound/vless.go
 @@ -24,7 +24,9 @@ import (
@@ -102,7 +102,7 @@ index 547f3c9..75bfcfd 100644
  	var addons *vless.Addons
  	if len(option.Flow) >= 16 {
  		option.Flow = option.Flow[:16]
-@@ -559,6 +597,15 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -558,6 +596,15 @@ func NewVless(option VlessOption) (*Vless, error) {
  	}
  
  	switch option.Network {
@@ -323,10 +323,10 @@ index 0000000..e80dd4d
 +	}
 +}
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 8622e70..b1d9701 100644
+index 68bccdb..f7476cd 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -246,6 +246,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -238,6 +238,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  			return nil, err
  		}
  		if muxOption.Enabled {

@@ -28,7 +28,7 @@ index 4d6c9b0..33a9186 100644
 +	return target
 +}
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index dd6d44b..0eeb082 100644
+index bef0b85..7b7a148 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -715,6 +715,9 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err

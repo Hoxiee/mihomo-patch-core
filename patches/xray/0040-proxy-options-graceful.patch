@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0040-proxy-options-graceful
-Source: ClashFest core patch 0040 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0040 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0040: unusable proxy options are ignored, not fatal.
 
@@ -115,10 +115,10 @@ index 8c8e82c..96d9d8b 100644
  	}
  
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 84e4967..0791a7b 100644
+index 4f2061c..d6f52ce 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -10,6 +10,7 @@ import (
+@@ -8,6 +8,7 @@ import (
  	"github.com/metacubex/mihomo/common/structure"
  	"github.com/metacubex/mihomo/component/fragment"
  	C "github.com/metacubex/mihomo/constant"
@@ -126,7 +126,7 @@ index 84e4967..0791a7b 100644
  	"github.com/metacubex/mihomo/transport/vless"
  )
  
-@@ -20,16 +21,28 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -18,16 +19,28 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		return nil, fmt.Errorf("missing type")
  	}
  
@@ -165,7 +165,7 @@ index 84e4967..0791a7b 100644
  	}
  
  	opt := applyProxyOptions(options...)
-@@ -254,10 +267,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -247,10 +260,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  	}
  
  	if muxCoolMapping, ok := mapping["mux.cool"].(map[string]any); ok {
@@ -179,7 +179,7 @@ index 84e4967..0791a7b 100644
  	}
  
  	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
-@@ -342,15 +354,17 @@ func firstString(mapping map[string]any, keys ...string) string {
+@@ -277,15 +289,17 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  
  // wrapMuxCool applies the opt-in "mux.cool" block of a vless proxy: TCP
  // streams and UDP (XUDP) share pooled VLESS Mux.Cool carriers, as Xray's
@@ -202,7 +202,7 @@ index 84e4967..0791a7b 100644
  	}
  	err := checkMuxCool(mapping, decoder)
  	var wrapped outbound.ProxyAdapter
-@@ -358,10 +372,10 @@ func wrapMuxCool(mapping, muxCoolMapping map[string]any, proxy outbound.ProxyAda
+@@ -293,10 +307,10 @@ func wrapMuxCool(mapping, muxCoolMapping map[string]any, proxy outbound.ProxyAda
  		wrapped, err = outbound.NewMuxCool(option, proxy)
  	}
  	if err != nil {

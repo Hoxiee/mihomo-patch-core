@@ -32,7 +32,7 @@ index 99b9d9d..4d6c9b0 100644
 +	return nil, nil, fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 +}
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 07608d4..dd6d44b 100644
+index a15e131..bef0b85 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -327,13 +327,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro

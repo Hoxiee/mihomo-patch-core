@@ -33,10 +33,10 @@ index 0000000..98e4f53
 +	return factory, ok
 +}
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 68bccdb..0d8875f 100644
+index d6f52ce..0138210 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -224,7 +224,11 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -252,7 +252,11 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		}
  		proxy, err = outbound.NewEasyTier(*easyTierOption)
  	default:

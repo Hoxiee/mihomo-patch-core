@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Apply, revert, and inspect the mihomo-patch-core series.
+# Apply, revert, and inspect a mihomo-patch-core profile.
 #
 # Usage:
-#   tool/patch.sh <list|status|check|apply|revert> [target] [--target DIR]
+#   tool/patch.sh <list|status|check|apply|revert> [target] [--target DIR] [--profile NAME]
 #
 # The target is a mihomo git checkout. It defaults to $MIHOMO_DIR.
+# The profile defaults to $MIHOMO_PROFILE, then reclash.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-ORDER="$ROOT/patches/order.txt"
+profile=${MIHOMO_PROFILE:-reclash}
 
 die() {
   printf 'mihomo-patch-core: %s\n' "$*" >&2
@@ -16,7 +17,24 @@ die() {
 }
 
 usage() {
-  sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+read_profile() {
+  local file="$ROOT/profiles/$1"
+  [ -f "$file" ] || die "profile not found: $1"
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      ''|\#*) continue ;;
+      include\ *)
+        read_profile "${line#include }"
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < "$file"
 }
 
 cmd=${1:-status}
@@ -28,6 +46,11 @@ while [ $# -gt 0 ]; do
     --target)
       [ $# -ge 2 ] || die '--target needs a directory'
       target=$2
+      shift 2
+      ;;
+    --profile)
+      [ $# -ge 2 ] || die '--profile needs a name'
+      profile=$2
       shift 2
       ;;
     -h|--help)
@@ -42,8 +65,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 target=${target:-${MIHOMO_DIR:-}}
-
-mapfile -t patches < <(grep -v '^[[:space:]]*#' "$ORDER" | grep -v '^[[:space:]]*$')
+mapfile -t patches < <(read_profile "$profile.txt")
 
 patch_path() {
   printf '%s/patches/%s' "$ROOT" "$1"

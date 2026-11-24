@@ -1,8 +1,8 @@
-mihomo-patch-core: host/0001-flclash-host-integration
-Source: Hoxiee/mihomo 797b6757 (GPL-3.0), extracted from the ReClash core fork.
+mihomo-patch-core: flclash/0001-flclash-host-integration
+Source: FlClash through Hoxiee/mihomo 797b6757 (GPL-3.0).
 
 diff --git a/adapter/adapter.go b/adapter/adapter.go
-index 422232b3..9cd4fa01 100644
+index 422232b..9cd4fa0 100644
 --- a/adapter/adapter.go
 +++ b/adapter/adapter.go
 @@ -167,6 +167,10 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
@@ -17,7 +17,7 @@ index 422232b3..9cd4fa01 100644
  		record := C.DelayHistory{Time: time.Now()}
  		if alive {
 diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
-index 1e2b2ef7..a204647f 100644
+index 1e2b2ef..a204647 100644
 --- a/adapter/outbound/direct.go
 +++ b/adapter/outbound/direct.go
 @@ -27,7 +27,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
@@ -39,7 +39,7 @@ index 1e2b2ef7..a204647f 100644
  			return fmt.Errorf("can't resolve ip: %w", err)
  		}
 diff --git a/adapter/outbound/util.go b/adapter/outbound/util.go
-index 41bc3056..73bac0e8 100644
+index 41bc305..73bac0e 100644
 --- a/adapter/outbound/util.go
 +++ b/adapter/outbound/util.go
 @@ -51,7 +51,7 @@ func resolveUDPAddr(ctx context.Context, network, address string, prefer C.DNSPr
@@ -52,7 +52,7 @@ index 41bc3056..73bac0e8 100644
  	if err != nil {
  		return nil, err
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
-index 98aaf20a..d6f61348 100644
+index 98aaf20..d6f6134 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
 @@ -173,6 +173,7 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
@@ -64,7 +64,7 @@ index 98aaf20a..d6f61348 100644
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
 diff --git a/adapter/outboundgroup/groupbase.go b/adapter/outboundgroup/groupbase.go
-index eed45e0d..27900604 100644
+index eed45e0..2790060 100644
 --- a/adapter/outboundgroup/groupbase.go
 +++ b/adapter/outboundgroup/groupbase.go
 @@ -34,6 +34,7 @@ type GroupBase struct {
@@ -125,7 +125,7 @@ index eed45e0d..27900604 100644
  	// Multiple filers means that proxies are sorted in the order in which the filers appear.
  	// Although the filter has been performed once in the previous process,
 diff --git a/adapter/outboundgroup/loadbalance.go b/adapter/outboundgroup/loadbalance.go
-index e6439042..aa2d41e4 100644
+index e643904..aa2d41e 100644
 --- a/adapter/outboundgroup/loadbalance.go
 +++ b/adapter/outboundgroup/loadbalance.go
 @@ -319,6 +319,7 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
@@ -137,7 +137,7 @@ index e6439042..aa2d41e4 100644
  		strategyFn:     strategyFn,
  		disableUDP:     option.DisableUDP,
 diff --git a/adapter/outboundgroup/parser.go b/adapter/outboundgroup/parser.go
-index e97f8da0..139ad517 100644
+index e97f8da..139ad51 100644
 --- a/adapter/outboundgroup/parser.go
 +++ b/adapter/outboundgroup/parser.go
 @@ -43,6 +43,8 @@ type GroupCommonOption struct {
@@ -151,7 +151,7 @@ index e97f8da0..139ad517 100644
  func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (ProxyGroup, error) {
 diff --git a/adapter/outboundgroup/patch.go b/adapter/outboundgroup/patch.go
 new file mode 100644
-index 00000000..98d185b8
+index 0000000..98d185b
 --- /dev/null
 +++ b/adapter/outboundgroup/patch.go
 @@ -0,0 +1,50 @@
@@ -207,7 +207,7 @@ index 00000000..98d185b8
 +}
 diff --git a/adapter/outboundgroup/patch_test.go b/adapter/outboundgroup/patch_test.go
 new file mode 100644
-index 00000000..ad38e4a5
+index 0000000..ad38e4a
 --- /dev/null
 +++ b/adapter/outboundgroup/patch_test.go
 @@ -0,0 +1,102 @@
@@ -314,7 +314,7 @@ index 00000000..ad38e4a5
 +	}
 +}
 diff --git a/adapter/outboundgroup/selector.go b/adapter/outboundgroup/selector.go
-index 2fea7503..0e0e318a 100644
+index 2fea750..0e0e318 100644
 --- a/adapter/outboundgroup/selector.go
 +++ b/adapter/outboundgroup/selector.go
 @@ -133,6 +133,7 @@ func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyF
@@ -326,7 +326,7 @@ index 2fea7503..0e0e318a 100644
  		selected:   selectorOption.DefaultSelected,
  		disableUDP: option.DisableUDP,
 diff --git a/adapter/outboundgroup/urltest.go b/adapter/outboundgroup/urltest.go
-index 64e4def0..35bc687e 100644
+index 64e4def..35bc687 100644
 --- a/adapter/outboundgroup/urltest.go
 +++ b/adapter/outboundgroup/urltest.go
 @@ -209,6 +209,7 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
@@ -339,7 +339,7 @@ index 64e4def0..35bc687e 100644
  		disableUDP:     option.DisableUDP,
 diff --git a/adapter/patch.go b/adapter/patch.go
 new file mode 100644
-index 00000000..f946f31a
+index 0000000..f946f31
 --- /dev/null
 +++ b/adapter/patch.go
 @@ -0,0 +1,7 @@
@@ -352,7 +352,7 @@ index 00000000..f946f31a
 +var UrlTestHook UrlTestCheck
 diff --git a/adapter/provider/patch.go b/adapter/provider/patch.go
 new file mode 100644
-index 00000000..1f3306a6
+index 0000000..1f3306a
 --- /dev/null
 +++ b/adapter/provider/patch.go
 @@ -0,0 +1,5 @@
@@ -363,7 +363,7 @@ index 00000000..1f3306a6
 +}
 diff --git a/adapter/provider/patch_mapping.go b/adapter/provider/patch_mapping.go
 new file mode 100644
-index 00000000..8d361462
+index 0000000..8d36146
 --- /dev/null
 +++ b/adapter/provider/patch_mapping.go
 @@ -0,0 +1,126 @@
@@ -494,7 +494,7 @@ index 00000000..8d361462
 +	return yaml.Marshal(ProxySchema{Proxies: payload})
 +}
 diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
-index 6a05c8bc..24ab67f1 100644
+index 6a05c8b..24ab67f 100644
 --- a/component/dialer/dialer.go
 +++ b/component/dialer/dialer.go
 @@ -385,6 +385,7 @@ func parseAddr(ctx context.Context, network, address string, preferResolver reso
@@ -506,7 +506,7 @@ index 6a05c8bc..24ab67f1 100644
  
  	var ips []netip.Addr
 diff --git a/component/http/http.go b/component/http/http.go
-index af6ffeaa..a0f88237 100644
+index af6ffea..a0f8823 100644
 --- a/component/http/http.go
 +++ b/component/http/http.go
 @@ -66,6 +66,7 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
@@ -519,7 +519,7 @@ index af6ffeaa..a0f88237 100644
  		// from http.DefaultTransport
 diff --git a/component/http/patch.go b/component/http/patch.go
 new file mode 100644
-index 00000000..1e19364f
+index 0000000..1e19364
 --- /dev/null
 +++ b/component/http/patch.go
 @@ -0,0 +1,15 @@
@@ -539,7 +539,7 @@ index 00000000..1e19364f
 +	}
 +}
 diff --git a/component/loopback/detector.go b/component/loopback/detector.go
-index 59d16ca8..02f71373 100644
+index 59d16ca..02f7137 100644
 --- a/component/loopback/detector.go
 +++ b/component/loopback/detector.go
 @@ -17,7 +17,7 @@ import (
@@ -552,7 +552,7 @@ index 59d16ca8..02f71373 100644
  	}
  }
 diff --git a/component/process/process.go b/component/process/process.go
-index 464f5a79..8b758b91 100644
+index 464f5a7..8b758b9 100644
 --- a/component/process/process.go
 +++ b/component/process/process.go
 @@ -22,12 +22,10 @@ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, str
@@ -570,7 +570,7 @@ index 464f5a79..8b758b91 100644
  
  func FindPackageName(metadata *C.Metadata) (string, error) {
 diff --git a/component/proxydialer/byname.go b/component/proxydialer/byname.go
-index 74fe644c..6c2575be 100644
+index 74fe644..6c2575b 100644
 --- a/component/proxydialer/byname.go
 +++ b/component/proxydialer/byname.go
 @@ -20,6 +20,10 @@ type byNameProxyDialer struct {
@@ -597,7 +597,7 @@ index 74fe644c..6c2575be 100644
  		return nil, fmt.Errorf("tunnel is invalid, must be proxydialer.Tunnel, but got: %T", d.tunnel)
 diff --git a/component/proxydialer/patch.go b/component/proxydialer/patch.go
 new file mode 100644
-index 00000000..2bc301f7
+index 0000000..2bc301f
 --- /dev/null
 +++ b/component/proxydialer/patch.go
 @@ -0,0 +1,37 @@
@@ -640,7 +640,7 @@ index 00000000..2bc301f7
 +}
 diff --git a/component/proxydialer/patch_test.go b/component/proxydialer/patch_test.go
 new file mode 100644
-index 00000000..b483378d
+index 0000000..b483378
 --- /dev/null
 +++ b/component/proxydialer/patch_test.go
 @@ -0,0 +1,75 @@
@@ -721,7 +721,7 @@ index 00000000..b483378d
 +}
 diff --git a/component/resolver/patch.go b/component/resolver/patch.go
 new file mode 100644
-index 00000000..a0a94b40
+index 0000000..a0a94b4
 --- /dev/null
 +++ b/component/resolver/patch.go
 @@ -0,0 +1,22 @@
@@ -748,7 +748,7 @@ index 00000000..a0a94b40
 +	return initiator
 +}
 diff --git a/component/resource/fetcher.go b/component/resource/fetcher.go
-index 464af2e7..6d671c81 100644
+index 464af2e..6d671c8 100644
 --- a/component/resource/fetcher.go
 +++ b/component/resource/fetcher.go
 @@ -236,7 +236,7 @@ func (f *Fetcher[V]) updateCallback(path string) {
@@ -762,7 +762,7 @@ index 464af2e7..6d671c81 100644
  
 diff --git a/component/updater/patch.go b/component/updater/patch.go
 new file mode 100644
-index 00000000..02096ab4
+index 0000000..02096ab
 --- /dev/null
 +++ b/component/updater/patch.go
 @@ -0,0 +1,53 @@
@@ -820,7 +820,7 @@ index 00000000..02096ab4
 +	registerGeoUpdater(ctx)
 +}
 diff --git a/component/updater/update_geo.go b/component/updater/update_geo.go
-index 63e6d150..22983385 100644
+index 63e6d15..2298338 100644
 --- a/component/updater/update_geo.go
 +++ b/component/updater/update_geo.go
 @@ -45,6 +45,10 @@ func SetGeoUpdateInterval(newGeoUpdateInterval int) {
@@ -963,10 +963,10 @@ index 63e6d150..22983385 100644
  		}
  	}()
 diff --git a/config/config.go b/config/config.go
-index cc8c1016..bd4ef131 100644
+index 8bea42e..db5bb9c 100644
 --- a/config/config.go
 +++ b/config/config.go
-@@ -995,6 +995,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
+@@ -1012,6 +1012,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
  		return nil, nil, err
  	}
  
@@ -976,7 +976,7 @@ index cc8c1016..bd4ef131 100644
  
 diff --git a/config/patch.go b/config/patch.go
 new file mode 100644
-index 00000000..01c415ab
+index 0000000..01c415a
 --- /dev/null
 +++ b/config/patch.go
 @@ -0,0 +1,20 @@
@@ -1001,7 +1001,7 @@ index 00000000..01c415ab
 +	proxyNameList = list
 +}
 diff --git a/constant/adapters.go b/constant/adapters.go
-index 9b0b70ce..ffb1f2a7 100644
+index 9b0b70c..ffb1f2a 100644
 --- a/constant/adapters.go
 +++ b/constant/adapters.go
 @@ -62,9 +62,10 @@ const (
@@ -1018,7 +1018,7 @@ index 9b0b70ce..ffb1f2a7 100644
  type Connection interface {
 diff --git a/constant/features/android.go b/constant/features/android.go
 new file mode 100644
-index 00000000..c1174f08
+index 0000000..c1174f0
 --- /dev/null
 +++ b/constant/features/android.go
 @@ -0,0 +1,5 @@
@@ -1029,7 +1029,7 @@ index 00000000..c1174f08
 +const Android = true
 diff --git a/constant/features/android_stub.go b/constant/features/android_stub.go
 new file mode 100644
-index 00000000..282493e7
+index 0000000..282493e
 --- /dev/null
 +++ b/constant/features/android_stub.go
 @@ -0,0 +1,5 @@
@@ -1040,7 +1040,7 @@ index 00000000..282493e7
 +const Android = false
 diff --git a/constant/features/cmfa.go b/constant/features/cmfa.go
 deleted file mode 100644
-index 9a81d82f..00000000
+index 9a81d82..0000000
 --- a/constant/features/cmfa.go
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -1051,7 +1051,7 @@ index 9a81d82f..00000000
 -const CMFA = true
 diff --git a/constant/features/cmfa_stub.go b/constant/features/cmfa_stub.go
 deleted file mode 100644
-index f7ef0827..00000000
+index f7ef082..0000000
 --- a/constant/features/cmfa_stub.go
 +++ /dev/null
 @@ -1,5 +0,0 @@
@@ -1061,7 +1061,7 @@ index f7ef0827..00000000
 -
 -const CMFA = false
 diff --git a/constant/features/tags.go b/constant/features/tags.go
-index bf27c248..4c90ac28 100644
+index bf27c24..4c90ac2 100644
 --- a/constant/features/tags.go
 +++ b/constant/features/tags.go
 @@ -1,9 +1,6 @@
@@ -1075,7 +1075,7 @@ index bf27c248..4c90ac28 100644
  		tags = append(tags, "with_low_memory")
  	}
 diff --git a/constant/path.go b/constant/path.go
-index f2463a4a..590928d0 100644
+index f2463a4..590928d 100644
 --- a/constant/path.go
 +++ b/constant/path.go
 @@ -86,7 +86,7 @@ func (p *path) Resolve(path string) string {
@@ -1119,7 +1119,7 @@ index f2463a4a..590928d0 100644
  			}
 diff --git a/dns/patch.go b/dns/patch.go
 new file mode 100644
-index 00000000..5ae0adf8
+index 0000000..5ae0adf
 --- /dev/null
 +++ b/dns/patch.go
 @@ -0,0 +1,125 @@
@@ -1249,7 +1249,7 @@ index 00000000..5ae0adf8
 +	t.notify(record)
 +}
 diff --git a/dns/patch_android.go b/dns/patch_android.go
-index cad718b6..138e95d5 100644
+index cad718b..138e95d 100644
 --- a/dns/patch_android.go
 +++ b/dns/patch_android.go
 @@ -1,4 +1,4 @@
@@ -1260,7 +1260,7 @@ index cad718b6..138e95d5 100644
  
 diff --git a/dns/patch_clear.go b/dns/patch_clear.go
 new file mode 100644
-index 00000000..1b3c961d
+index 0000000..1b3c961
 --- /dev/null
 +++ b/dns/patch_clear.go
 @@ -0,0 +1,85 @@
@@ -1351,7 +1351,7 @@ index 00000000..1b3c961d
 +}
 diff --git a/dns/patch_test.go b/dns/patch_test.go
 new file mode 100644
-index 00000000..41c3c3d7
+index 0000000..41c3c3d
 --- /dev/null
 +++ b/dns/patch_test.go
 @@ -0,0 +1,311 @@
@@ -1667,18 +1667,18 @@ index 00000000..41c3c3d7
 +	}
 +}
 diff --git a/dns/resolver.go b/dns/resolver.go
-index b8742f24..32fbb3d1 100644
+index 20848c6..534bb03 100644
 --- a/dns/resolver.go
 +++ b/dns/resolver.go
-@@ -169,6 +169,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+@@ -174,6 +174,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
  	msg, expireTime, hit := getMsgFromCache(r.cache, q)
  	if hit {
  		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
 +		r.traceCacheHit(ctx, q, msg)
  		now := time.Now()
  		if expireTime.Before(now) {
- 			setMsgTTL(msg, uint32(1)) // Continue fetch
-@@ -188,9 +189,11 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
+ 			if r.noServeExpired || (r.serveExpiredTTL > 0 && now.Sub(expireTime) > r.serveExpiredTTL) {
+@@ -225,9 +226,11 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
  
  	retryNum := 0
  	retryMax := 3
@@ -1690,7 +1690,7 @@ index b8742f24..32fbb3d1 100644
  		cache := false
  
  		defer func() {
-@@ -205,6 +208,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
+@@ -242,6 +245,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
  				putMsgToCache(r.cache, q, result)
  			}
  		}()
@@ -1699,7 +1699,7 @@ index b8742f24..32fbb3d1 100644
  		isIPReq := isIPRequest(q)
  		if isIPReq {
 diff --git a/dns/system_common.go b/dns/system_common.go
-index e6dabdcf..78c4a86f 100644
+index e6dabdc..78c4a86 100644
 --- a/dns/system_common.go
 +++ b/dns/system_common.go
 @@ -1,4 +1,4 @@
@@ -1709,7 +1709,7 @@ index e6dabdcf..78c4a86f 100644
  package dns
  
 diff --git a/dns/util.go b/dns/util.go
-index 0a0c6e48..71dcaf06 100644
+index 0a0c6e4..71dcaf0 100644
 --- a/dns/util.go
 +++ b/dns/util.go
 @@ -421,6 +421,7 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
@@ -1729,7 +1729,7 @@ index 0a0c6e48..71dcaf06 100644
  		})
  	}
 diff --git a/hub/executor/executor.go b/hub/executor/executor.go
-index 796face2..dc7c66b9 100644
+index a3dbe3c..f1bc2f5 100644
 --- a/hub/executor/executor.go
 +++ b/hub/executor/executor.go
 @@ -104,8 +104,8 @@ func ApplyConfig(cfg *config.Config, force bool) {
@@ -1743,7 +1743,7 @@ index 796face2..dc7c66b9 100644
  	updateIPTables(cfg)
  	updateTunnels(cfg.Tunnels)
  
-@@ -328,13 +328,17 @@ func loadProvider[T P.Provider](providers map[string]T) {
+@@ -333,13 +333,17 @@ func loadProvider[T P.Provider](providers map[string]T) {
  			switch pv.Type() {
  			case P.Proxy:
  				{
@@ -1763,7 +1763,7 @@ index 796face2..dc7c66b9 100644
  		}
  	}
  
-@@ -349,7 +353,6 @@ func loadProvider[T P.Provider](providers map[string]T) {
+@@ -354,7 +358,6 @@ func loadProvider[T P.Provider](providers map[string]T) {
  			load(pv)
  		}()
  	}
@@ -1773,7 +1773,7 @@ index 796face2..dc7c66b9 100644
  func updateSniffer(snifferConfig *sniffer.Config) {
 diff --git a/hub/executor/patch.go b/hub/executor/patch.go
 new file mode 100644
-index 00000000..1cbbbbc0
+index 0000000..1cbbbbc
 --- /dev/null
 +++ b/hub/executor/patch.go
 @@ -0,0 +1,5 @@
@@ -1783,7 +1783,7 @@ index 00000000..1cbbbbc0
 +
 +var DefaultProviderLoadedHook ProviderLoadedHook
 diff --git a/hub/route/patch_android.go b/hub/route/patch_android.go
-index 5eba2796..4b6dcf25 100644
+index 5eba279..4b6dcf2 100644
 --- a/hub/route/patch_android.go
 +++ b/hub/route/patch_android.go
 @@ -1,4 +1,4 @@
@@ -1793,7 +1793,7 @@ index 5eba2796..4b6dcf25 100644
  package route
  
 diff --git a/hub/route/server.go b/hub/route/server.go
-index 6d37d480..b1659cd0 100644
+index 6d37d48..b1659cd 100644
 --- a/hub/route/server.go
 +++ b/hub/route/server.go
 @@ -181,9 +181,7 @@ func start(cfg *Config) {
@@ -1809,7 +1809,7 @@ index 6d37d480..b1659cd0 100644
  
 diff --git a/listener/http/patch_android.go b/listener/http/patch_android.go
 new file mode 100644
-index 00000000..a763c95e
+index 0000000..a763c95
 --- /dev/null
 +++ b/listener/http/patch_android.go
 @@ -0,0 +1,9 @@
@@ -1823,7 +1823,7 @@ index 00000000..a763c95e
 +	return l.listener
 +}
 diff --git a/listener/listener.go b/listener/listener.go
-index 3a0a8aad..ececbc41 100644
+index 3a0a8aa..ececbc4 100644
 --- a/listener/listener.go
 +++ b/listener/listener.go
 @@ -512,10 +512,8 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
@@ -1841,7 +1841,7 @@ index 3a0a8aad..ececbc41 100644
  
 diff --git a/listener/patch.go b/listener/patch.go
 new file mode 100644
-index 00000000..6ab5aa11
+index 0000000..6ab5aa1
 --- /dev/null
 +++ b/listener/patch.go
 @@ -0,0 +1,74 @@
@@ -1920,7 +1920,7 @@ index 00000000..6ab5aa11
 +	}
 +}
 diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
-index 5415b25e..3373a464 100644
+index 5415b25..3373a46 100644
 --- a/listener/sing_tun/server.go
 +++ b/listener/sing_tun/server.go
 @@ -477,12 +477,6 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
@@ -1937,7 +1937,7 @@ index 5415b25e..3373a464 100644
  	if err != nil {
  		err = E.Cause(err, "configure tun interface")
 diff --git a/listener/sing_tun/server_android.go b/listener/sing_tun/server_android.go
-index f180bd30..71ac2635 100644
+index f180bd3..71ac263 100644
 --- a/listener/sing_tun/server_android.go
 +++ b/listener/sing_tun/server_android.go
 @@ -1,77 +1,11 @@
@@ -2022,7 +2022,7 @@ index f180bd30..71ac2635 100644
 -}
 diff --git a/listener/sing_tun/server_notandroid.go b/listener/sing_tun/server_notandroid.go
 deleted file mode 100644
-index e393d4ca..00000000
+index e393d4c..0000000
 --- a/listener/sing_tun/server_notandroid.go
 +++ /dev/null
 @@ -1,11 +0,0 @@
@@ -2039,7 +2039,7 @@ index e393d4ca..00000000
 -}
 diff --git a/rules/provider/patch_android.go b/rules/provider/patch_android.go
 new file mode 100644
-index 00000000..a45b9c52
+index 0000000..a45b9c5
 --- /dev/null
 +++ b/rules/provider/patch_android.go
 @@ -0,0 +1,17 @@
@@ -2062,7 +2062,7 @@ index 00000000..a45b9c52
 +}
 diff --git a/tunnel/patch.go b/tunnel/patch.go
 new file mode 100644
-index 00000000..d3ae861a
+index 0000000..d3ae861
 --- /dev/null
 +++ b/tunnel/patch.go
 @@ -0,0 +1,123 @@
@@ -2190,7 +2190,7 @@ index 00000000..d3ae861a
 +	return proxy, err
 +}
 diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
-index c69746db..eeb3cd4f 100644
+index c69746d..eeb3cd4 100644
 --- a/tunnel/statistic/manager.go
 +++ b/tunnel/statistic/manager.go
 @@ -26,18 +26,27 @@ func init() {
@@ -2279,7 +2279,7 @@ index c69746db..eeb3cd4f 100644
  
 diff --git a/tunnel/statistic/patch.go b/tunnel/statistic/patch.go
 new file mode 100644
-index 00000000..e3e11f37
+index 0000000..e3e11f3
 --- /dev/null
 +++ b/tunnel/statistic/patch.go
 @@ -0,0 +1,24 @@
@@ -2309,7 +2309,7 @@ index 00000000..e3e11f37
 +}
 diff --git a/tunnel/statistic/patch_android.go b/tunnel/statistic/patch_android.go
 new file mode 100644
-index 00000000..1c4b43b0
+index 0000000..1c4b43b
 --- /dev/null
 +++ b/tunnel/statistic/patch_android.go
 @@ -0,0 +1,3 @@
@@ -2317,7 +2317,7 @@ index 00000000..1c4b43b0
 +
 +package statistic
 diff --git a/tunnel/statistic/tracker.go b/tunnel/statistic/tracker.go
-index 2fbb1cf9..78a53c8c 100644
+index 2fbb1cf..78a53c8 100644
 --- a/tunnel/statistic/tracker.go
 +++ b/tunnel/statistic/tracker.go
 @@ -39,6 +39,7 @@ type tcpTracker struct {
@@ -2477,7 +2477,7 @@ index 2fbb1cf9..78a53c8c 100644
  	}
  
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14a..92afa706 100644
+index be897aa..ddcadce 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -231,6 +231,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox

@@ -1,19 +1,4 @@
-# mihomo-patch-core apply order.
-# FlClash host integration first, then ReClash product layers, Xray compatibility,
-# diagnostics, and the local adaptation.
-host/0001-flclash-host-integration.patch
-reclash/0001-external-adapter-registry.patch
-reclash/0002-proxy-metadata.patch
-reclash/0003-dial-hooks.patch
-reclash/0004-provider-health-scheduling.patch
-reclash/0005-flow-evidence.patch
-reclash/0006-connection-progress.patch
-reclash/0007-policy-hooks.patch
-reclash/0008-site-lock.patch
-reclash/0009-direct-split.patch
-reclash/0010-geo-digest.patch
-reclash/0011-listener-plumbing.patch
-reclash/0012-controller-serve-log.patch
+# Core: mihomo v1.19.34 plus Xray compatibility and neutral diagnostics.
 xray/0001-reality-configurable-client-version.patch
 xray/0002-reality-adaptive-mlkem.patch
 xray/0003-vless-xdrive.patch
@@ -52,4 +37,3 @@ xray/0046-trojan-reality-share-links.patch
 diagnostics/0001-probe-error-details.patch
 diagnostics/0002-proxy-transfer-test.patch
 diagnostics/0003-proxy-transfer-export.patch
-compat/0001-finalmask-android-guard.patch

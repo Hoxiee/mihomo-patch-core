@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0039-snell-unsafe-raw-warning
-Source: ClashFest core patch 0039 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0039 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0039: warn about Snell v6 mode unsafe-raw at config load.
 
@@ -17,7 +17,7 @@ log.Subscribe and check that each is accepted, that only unsafe-raw warns and
 that it warns exactly once.
 
 diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
-index 1cc1168..7228dea 100644
+index ce5c58c..0974f4c 100644
 --- a/adapter/outbound/snell.go
 +++ b/adapter/outbound/snell.go
 @@ -9,6 +9,7 @@ import (

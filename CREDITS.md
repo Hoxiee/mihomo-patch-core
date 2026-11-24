@@ -9,11 +9,11 @@ kept wherever the source had them.
 - [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) — GPL-3.0. The upstream tree the series
   applies to (tag `v1.19.34`).
 
-## Host and ReClash layers
+## FlClash and ReClash layers
 
 - [Hoxiee/mihomo](https://github.com/Hoxiee/mihomo), branch `ReClash` — GPL-3.0. FlClash host
-  integration (`797b6757`) is kept as one patch; the ReClash additions of `5635c762` are split
-  into the `reclash/` layer by concern.
+  integration (`797b6757`) is kept as one patch in `flclash/`; the ReClash additions of
+  `5635c762` are split into the `reclash/` layer by concern.
 - [chen08209/FlClash](https://github.com/chen08209/FlClash) — GPL-3.0. The host integration this
   layer descends from.
 
@@ -34,7 +34,7 @@ kept wherever the source had them.
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core) — MPL-2.0. The XDRIVE transport files carry
   their original MPL-2.0 headers; keep them when redistributing.
 
-## Diagnostics layer
+## Core diagnostics
 
 - [Nemu-x/ClashFest](https://github.com/Nemu-x/ClashFest) — GPL-3.0. Probe error details
   (ClashFest 0016) and the transfer test (ClashFest 0024–0025), with the router hunk adapted to

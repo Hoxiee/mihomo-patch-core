@@ -1,8 +1,8 @@
 mihomo-patch-core: xray/0012-tcp-connect-timeout
-Source: ClashFest core patch 0012 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0012 (GPL-3.0), ported to the core series.
 
 diff --git a/config/config.go b/config/config.go
-index bd4ef13..26536f8 100644
+index cc8c101..5e4de37 100644
 --- a/config/config.go
 +++ b/config/config.go
 @@ -60,6 +60,7 @@ type General struct {
@@ -48,7 +48,7 @@ index bd4ef13..26536f8 100644
  		GlobalUA:          cfg.GlobalUA,
  		ETagSupport:       cfg.ETagSupport,
 diff --git a/hub/executor/executor.go b/hub/executor/executor.go
-index dc7c66b..cda20cf 100644
+index 796face..c240de2 100644
 --- a/hub/executor/executor.go
 +++ b/hub/executor/executor.go
 @@ -171,6 +171,7 @@ func GetGeneral() *config.General {
@@ -59,7 +59,7 @@ index dc7c66b..cda20cf 100644
  		FindProcessMode:   tunnel.FindProcessMode(),
  		Sniffing:          tunnel.IsSniffing(),
  		GlobalUA:          mihomoHttp.UA(),
-@@ -399,6 +400,7 @@ func updateGeneral(general *config.General, logging bool) {
+@@ -396,6 +397,7 @@ func updateGeneral(general *config.General, logging bool) {
  	resolver.DisableIPv6 = !general.IPv6
  
  	dialer.SetTcpConcurrent(general.TCPConcurrent)
@@ -165,15 +165,15 @@ index 0000000..b1142aa
 +	}
 +}
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 0eeb082..7b7a148 100644
+index 86dbc14..be897aa 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
-@@ -597,7 +597,7 @@ func handleTCPConn(connCtx C.ConnContext) {
+@@ -571,7 +571,7 @@ func handleTCPConn(connCtx C.ConnContext) {
  	var peekBytes []byte
  	var peekLen int
  
 -	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
 +	ctx, cancel := tcpConnectContext(context.Background())
  	defer cancel()
- 	dialStarted := time.Now()
- 	notifyFlowEvidence(FlowEvidenceDialStarted, metadata, rule, proxy, nil, 0)
+ 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
+ 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)

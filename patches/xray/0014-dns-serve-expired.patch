@@ -1,8 +1,8 @@
 mihomo-patch-core: xray/0014-dns-serve-expired
-Source: ClashFest core patch 0014 (GPL-3.0), adapted to the ReClash host layer.
+Source: ClashFest core patch 0014 (GPL-3.0), ported to the core series.
 
 diff --git a/config/config.go b/config/config.go
-index bbe796a..db5bb9c 100644
+index 244d37e..8bea42e 100644
 --- a/config/config.go
 +++ b/config/config.go
 @@ -174,6 +174,11 @@ type DNS struct {
@@ -35,7 +35,7 @@ index bbe796a..db5bb9c 100644
  			FallbackFilter: RawFallbackFilter{
  				GeoIP:     true,
  				GeoIPCode: "CN",
-@@ -1443,6 +1452,17 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
+@@ -1442,6 +1451,17 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
  		EnhancedMode:      cfg.EnhancedMode,
  		CacheAlgorithm:    cfg.CacheAlgorithm,
  		CacheMaxSize:      cfg.CacheMaxSize,
@@ -54,7 +54,7 @@ index bbe796a..db5bb9c 100644
  	var err error
  	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
 diff --git a/dns/resolver.go b/dns/resolver.go
-index 32fbb3d..534bb03 100644
+index b8742f2..20848c6 100644
 --- a/dns/resolver.go
 +++ b/dns/resolver.go
 @@ -48,6 +48,11 @@ type Resolver struct {
@@ -69,8 +69,8 @@ index 32fbb3d..534bb03 100644
  }
  
  func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
-@@ -172,6 +177,12 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
- 		r.traceCacheHit(ctx, q, msg)
+@@ -171,6 +176,12 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+ 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
  		now := time.Now()
  		if expireTime.Before(now) {
 +			if r.noServeExpired || (r.serveExpiredTTL > 0 && now.Sub(expireTime) > r.serveExpiredTTL) {
@@ -82,7 +82,7 @@ index 32fbb3d..534bb03 100644
  			setMsgTTL(msg, uint32(1)) // Continue fetch
  			continueFetch = true
  		} else {
-@@ -183,6 +194,32 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+@@ -182,6 +193,32 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
  	return r.exchangeWithoutCache(ctx, m)
  }
  
@@ -115,7 +115,7 @@ index 32fbb3d..534bb03 100644
  // ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
  func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
  	q := m.Question[0]
-@@ -487,6 +524,11 @@ type Config struct {
+@@ -483,6 +520,11 @@ type Config struct {
  	ProxyServerPolicy    []Policy
  	CacheAlgorithm       string
  	CacheMaxSize         int
@@ -127,7 +127,7 @@ index 32fbb3d..534bb03 100644
  }
  
  func (config Config) newCache() dnsCache {
-@@ -637,6 +679,14 @@ func NewResolver(config Config) (rs Resolvers) {
+@@ -633,6 +675,14 @@ func NewResolver(config Config) (rs Resolvers) {
  		r.fallbackLazyQuery = config.FallbackLazyQuery
  	}
  
@@ -266,7 +266,7 @@ index 0000000..783374b
 +	}
 +}
 diff --git a/hub/executor/executor.go b/hub/executor/executor.go
-index cda20cf..f1bc2f5 100644
+index c240de2..a3dbe3c 100644
 --- a/hub/executor/executor.go
 +++ b/hub/executor/executor.go
 @@ -264,6 +264,10 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {

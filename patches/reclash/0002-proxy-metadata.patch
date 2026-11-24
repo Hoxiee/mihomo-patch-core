@@ -41,10 +41,10 @@ index 9978661..a3343f7 100644
  			TFO:          option.TFO,
  			MPTCP:        option.MPTCP,
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
-index d6942ba..235e108 100644
+index dfd37bf..050e244 100644
 --- a/adapter/outbound/base.go
 +++ b/adapter/outbound/base.go
-@@ -27,19 +27,20 @@ type ProxyAdapter interface {
+@@ -28,19 +28,20 @@ type ProxyAdapter interface {
  }
  
  type Base struct {
@@ -78,7 +78,7 @@ index d6942ba..235e108 100644
  }
  
  type BaseOption struct {
-@@ -47,6 +48,7 @@ type BaseOption struct {
+@@ -48,6 +49,7 @@ type BaseOption struct {
  	Addr         string
  	Type         C.AdapterType
  	ProviderName string
@@ -86,7 +86,7 @@ index d6942ba..235e108 100644
  	UDP          bool
  	XUDP         bool
  	TFO          bool
-@@ -58,18 +60,19 @@ type BaseOption struct {
+@@ -59,18 +61,19 @@ type BaseOption struct {
  
  func NewBase(opt BaseOption) *Base {
  	return &Base{
@@ -118,7 +118,7 @@ index d6942ba..235e108 100644
  	}
  }
  
-@@ -116,6 +119,7 @@ func (b *Base) ProxyInfo() (info C.ProxyInfo) {
+@@ -117,6 +120,7 @@ func (b *Base) ProxyInfo() (info C.ProxyInfo) {
  	info.Interface = b.iface
  	info.RoutingMark = b.rmark
  	info.ProviderName = b.pdName
@@ -126,7 +126,7 @@ index d6942ba..235e108 100644
  	return
  }
  
-@@ -204,6 +208,7 @@ type BasicOption struct {
+@@ -209,6 +213,7 @@ type BasicOption struct {
  	DialerForAPI C.Dialer `proxy:"-"` // the dialer used for API usage has higher priority than all the above configurations.
  	TunnelForAPI C.Tunnel `proxy:"-"`
  	ProviderName string   `proxy:"-"`
@@ -207,10 +207,10 @@ index 2603295..531af2a 100644
  			TFO:          option.FastOpen,
  			Interface:    option.Interface,
 diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
-index 4731611..7e804b0 100644
+index a574f52..559f2d0 100644
 --- a/adapter/outbound/hysteria2.go
 +++ b/adapter/outbound/hysteria2.go
-@@ -134,6 +134,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+@@ -135,6 +135,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
  			Addr:         addr,
  			Type:         C.Hysteria2,
  			ProviderName: option.ProviderName,
@@ -219,10 +219,10 @@ index 4731611..7e804b0 100644
  			Interface:    option.Interface,
  			RoutingMark:  option.RoutingMark,
 diff --git a/adapter/outbound/masque.go b/adapter/outbound/masque.go
-index 64b3a5e..2ddc605 100644
+index ca00609..47448c7 100644
 --- a/adapter/outbound/masque.go
 +++ b/adapter/outbound/masque.go
-@@ -120,6 +120,7 @@ func NewMasque(option MasqueOption) (*Masque, error) {
+@@ -121,6 +121,7 @@ func NewMasque(option MasqueOption) (*Masque, error) {
  			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
  			Type:         C.Masque,
  			ProviderName: option.ProviderName,
@@ -243,10 +243,10 @@ index 9f4e82d..6825d05 100644
  			TFO:          option.TFO,
  			MPTCP:        option.MPTCP,
 diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
-index 3c7b1e6..9f1ecb8 100644
+index 34604ac..2cd5b88 100644
 --- a/adapter/outbound/openvpn.go
 +++ b/adapter/outbound/openvpn.go
-@@ -132,6 +132,7 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
+@@ -143,6 +143,7 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
  			Addr:         cfg.RemoteAddress(),
  			Type:         C.OpenVPN,
  			ProviderName: option.ProviderName,
@@ -303,10 +303,10 @@ index fd386a8..374ac47 100644
  			TFO:          option.TFO,
  			MPTCP:        option.MPTCP,
 diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
-index ce5c58c..1cc1168 100644
+index 0974f4c..7228dea 100644
 --- a/adapter/outbound/snell.go
 +++ b/adapter/outbound/snell.go
-@@ -290,6 +290,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+@@ -297,6 +297,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
  			Addr:         addr,
  			Type:         C.Snell,
  			ProviderName: option.ProviderName,
@@ -363,10 +363,10 @@ index 2d487da..2b9871a 100644
  			Interface:    option.Interface,
  			RoutingMark:  option.RoutingMark,
 diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
-index d581e80..23a43a1 100644
+index 6896749..c5853ad 100644
 --- a/adapter/outbound/trojan.go
 +++ b/adapter/outbound/trojan.go
-@@ -293,6 +293,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+@@ -303,6 +303,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
  			Addr:         addr,
  			Type:         C.Trojan,
  			ProviderName: option.ProviderName,
@@ -399,10 +399,10 @@ index ed54d99..d2a8ab0 100644
  			TFO:          option.FastOpen,
  			Interface:    option.Interface,
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 1e5b168..547f3c9 100644
+index 5f39796..03f2205 100644
 --- a/adapter/outbound/vless.go
 +++ b/adapter/outbound/vless.go
-@@ -495,6 +495,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+@@ -566,6 +566,7 @@ func NewVless(option VlessOption) (*Vless, error) {
  			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
  			Type:         C.Vless,
  			ProviderName: option.ProviderName,
@@ -447,21 +447,19 @@ index deca249..d446a2e 100644
  			Interface:    option.Interface,
  			RoutingMark:  option.RoutingMark,
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 0d8875f..8622e70 100644
+index 0138210..0791a7b 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
-@@ -1,7 +1,10 @@
+@@ -1,6 +1,8 @@
  package adapter
  
  import (
 +	"crypto/sha256"
 +	"encoding/hex"
  	"fmt"
-+	"strings"
+ 	"strings"
  
- 	"github.com/metacubex/mihomo/adapter/outbound"
- 	"github.com/metacubex/mihomo/common/structure"
-@@ -20,6 +23,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -48,6 +50,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		DialerForAPI: opt.DialerForAPI,
  		TunnelForAPI: opt.TunnelForAPI,
  		ProviderName: opt.ProviderName,
@@ -469,7 +467,7 @@ index 0d8875f..8622e70 100644
  	}
  
  	var (
-@@ -250,7 +254,65 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -288,7 +291,65 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  	}
  
  	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
@@ -535,7 +533,7 @@ index 0d8875f..8622e70 100644
 +	return ""
  }
  
- type proxyOption struct {
+ // wrapMuxCool applies the opt-in "mux.cool" block of a vless proxy: TCP
 diff --git a/adapter/parser_easytier_reclash_test.go b/adapter/parser_easytier_reclash_test.go
 new file mode 100644
 index 0000000..28d215a

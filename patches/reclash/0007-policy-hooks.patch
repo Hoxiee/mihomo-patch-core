@@ -27,7 +27,7 @@ index d3ae861..99b9d9d 100644
 +var MetadataPolicyHook func(metadata *C.Metadata) error
 +var ModeChangeHook func(mode TunnelMode)
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 684c25b..07608d4 100644
+index 06789e7..a15e131 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -257,6 +257,9 @@ func Mode() TunnelMode {

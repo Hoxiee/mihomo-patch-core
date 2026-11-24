@@ -1,24 +1,25 @@
 # mihomo-patch-core
 
 A patch series that turns a clean [mihomo](https://github.com/MetaCubeX/mihomo) checkout into the
-proxy core ReClash runs. The upstream tree stays unmodified; every behaviour ReClash needs is a
-numbered, reviewable patch that can be rebased or deleted on its own.
+proxy core ReClash runs. The upstream tree stays unmodified; every behaviour is a numbered,
+reviewable patch that can be rebased or deleted on its own.
 
-The series is consumed by [ReClash](https://github.com/Hoxiee/ReClash) and is not a standalone
-proxy distribution. It replaces the long-lived `Hoxiee/mihomo` fork with explicit layers:
+The dependency direction is explicit:
 
-- **host** — FlClash host integration, taken from the FlClash repository; it keeps the
-  `feat: support FlClash` contract and is not ReClash-specific.
-- **reclash** — ReClash product logic, split from the former `feat: support ReClash` commit:
-  external adapters, proxy metadata, dial hooks, health scheduling, diagnostics, site lock,
-  policy hooks, direct split, geo digests and listener plumbing. Each concern is a separate patch.
-- **xray** — client-side Xray compatibility: REALITY, TLS fingerprints, ECH, mux.cool, finalmask,
-  XHTTP, XDRIVE, and share-link conversion.
-- **diagnostics** — probe error details and the transfer-level test.
-- **compat** — small adaptations where the Xray patches assume a different host environment.
+```
+core  ->  flclash  ->  reclash
+```
 
-The current status is **initial series**: it applies and its packages pass their tests on the
-pinned base. ReClash will move onto it after the integration is exercised in the application.
+- **core** — Xray compatibility and neutral diagnostics. It has no FlClash or ReClash references
+  and applies to a clean mihomo checkout on its own.
+- **flclash** — the FlClash host integration on top of core, plus the small adaptation that moves
+  the finalmask `features.CMFA` guard to FlClash's `features.Android`.
+- **reclash** — ReClash product logic on top of FlClash: external adapters, proxy metadata, dial
+  hooks, health scheduling, diagnostics, site lock, policy hooks, direct split, geo digests and
+  listener plumbing. Each concern is a separate patch.
+
+The profiles are the source of truth. A host layer never moves into core, and a core patch is
+never appended after a host patch.
 
 ## Base
 
@@ -30,18 +31,20 @@ MIHOMO_COMMIT=0455d0d28c4526937380505153e65a843d8612e8
 ```
 
 All patches are generated against that tag. A core bump starts by changing `base.env`, replaying
-the series, and fixing the first patch that no longer applies.
+the profiles, and fixing the first patch that no longer applies.
 
 ## Layout
 
 ```
 patches/
-  order.txt                 apply order, one patch per line
-  host/                     FlClash host integration (from FlClash)
+  xray/                     core: client-side Xray compatibility
+  diagnostics/              core: probe and transfer diagnostics
+  flclash/                  FlClash host integration and feature.Android adaptation
   reclash/                  ReClash product layers, one concern per patch
-  xray/                     client-side Xray compatibility
-  diagnostics/              probe and transfer diagnostics
-  compat/                   adaptations to the host layer
+profiles/
+  core.txt                  xray + diagnostics
+  flclash.txt               core + flclash
+  reclash.txt               flclash + reclash
 tool/
   patch.sh                  list / status / check / apply / revert
   test.sh                   fresh checkout + apply + go test
@@ -54,19 +57,19 @@ that say “ClashFest core patch 0027” still point at the right source.
 
 ## Apply
 
-The target is any mihomo git checkout at the pinned base:
+The target is any mihomo git checkout at the pinned base. The default profile is `reclash`:
 
 ```bash
-tool/patch.sh apply ../ReClash/core/mihomo
+tool/patch.sh apply ../ReClash/core/mihomo --profile reclash
 ```
 
-Other commands:
+Other commands and profiles:
 
 ```bash
-tool/patch.sh list
-tool/patch.sh status   ../ReClash/core/mihomo
-tool/patch.sh check    ../ReClash/core/mihomo
-tool/patch.sh revert   ../ReClash/core/mihomo
+tool/patch.sh list   --profile core
+tool/patch.sh status ../ReClash/core/mihomo --profile flclash
+tool/patch.sh check  ../ReClash/core/mihomo --profile core
+tool/patch.sh revert ../ReClash/core/mihomo --profile reclash
 ```
 
 `apply` uses plain `git apply`. It skips patches that are already applied and stops at the first
@@ -75,26 +78,29 @@ applied patches into the mihomo checkout: the series is the source of truth.
 
 ## Test
 
-`tool/test.sh` clones the pinned tag into a temporary directory, applies the series, adds the
-`mldsa` module the REALITY patch imports, and runs the patched packages:
+`tool/test.sh` clones the pinned tag into a temporary directory, applies the selected profile,
+adds the `mldsa` module the REALITY patch imports, and runs the patched packages:
 
 ```bash
-tool/test.sh
-tool/test.sh --keep   # leave the checkout for inspection
+tool/test.sh --profile core
+tool/test.sh --profile flclash
+tool/test.sh --profile reclash
+tool/test.sh --profile reclash --keep   # leave the checkout for inspection
 ```
 
 The packages are listed in `tool/packages.txt`. The build uses `with_gvisor`, the tag ReClash
 ships with. Tests that need an Xray binary or external network skip themselves.
 
-## Series
+## Profiles
 
-| Layer | Patches | What it carries |
+| Profile | Patches | Contents |
 |---|---:|---|
-| host | 1 | FlClash host integration |
-| reclash | 12 | external adapters, proxy metadata, dial hooks, health scheduling, flow and connection diagnostics, site lock, policy hooks, direct split, geo digests, listener plumbing |
-| xray | 35 | REALITY/TLS/ECH, XHTTP, mux.cool, XDRIVE, finalmask, fragment, share links, quality/security |
-| diagnostics | 3 | probe error details, transfer test and its in-process export |
-| compat | 1 | `features.CMFA` → `features.Android` in the finalmask xicmp guard |
+| `core` | 38 | xray 35 + diagnostics 3 |
+| `flclash` | 40 | core + FlClash host 1 + feature.Android adaptation 1 |
+| `reclash` | 52 | flclash + ReClash 12 |
+
+`core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
+is what the ReClash application consumes.
 
 ### ReClash layer
 
@@ -160,10 +166,10 @@ the former fork's comment-only edit to `component/process/process.go`; it had no
 ## Consuming from ReClash
 
 1. Pin `core/mihomo` to the tag in `base.env`.
-2. Apply the series in the build setup, before the Go build:
-   `tool/patch.sh apply core/mihomo`.
+2. Apply the ReClash profile in the build setup, before the Go build:
+   `tool/patch.sh apply core/mihomo --profile reclash`.
 3. Revert it before `git checkout`/`clean` of the submodule:
-   `tool/patch.sh revert core/mihomo`.
+   `tool/patch.sh revert core/mihomo --profile reclash`.
 4. Add the module the REALITY patch imports to the **application** module, not the submodule:
 
    ```
@@ -171,33 +177,36 @@ the former fork's comment-only edit to `component/process/process.go`; it had no
    ```
 
    in `core/go.mod`, then sync `core/go.sum`.
-5. Keep `core/mihomo` clean in git. The applied series is a build-tree state, not a commit.
+5. Keep `core/mihomo` clean in git. The applied profile is a build-tree state, not a commit.
 
-The compat patch exists because the host layer replaced upstream's `cmfa` build-tag constant with
-`features.Android`. If the host layer ever keeps `features.CMFA`, delete `compat/` and restore the
-`features.CMFA` references in `xray/0041`.
+The FlClash adaptation exists because FlClash replaces upstream's `cmfa` build-tag constant with
+`features.Android`; core keeps `features.CMFA`. If a host keeps `features.CMFA`, use the `core`
+profile and skip `flclash/0002`.
 
 ## Adding a patch
 
 - One concern per patch, numbered in the layer directory.
+- Core patches go in `xray/` or `diagnostics/` and must apply before any host layer.
+- Host patches go in `flclash/` or `reclash/` and must apply after the profile they extend.
 - Keep the original code credit. Patches ported from ClashFest/Prizrak/Veles/Citrus/Xray keep
   their comments and SPDX headers; add the source commit to the patch header.
 - Ship a test when the change is logic rather than a constant.
 - Record the condition under which the patch is deleted (upstream fix, feature removed, or the
   consuming app no longer needs it).
-- Append the patch to `patches/order.txt` after the patches it depends on.
+- Append the patch to the profile after the patches it depends on.
 - Do not renumber existing patches: external comments and commit messages refer to them.
 
 ## When a patch stops applying
 
-1. `tool/patch.sh apply <target>` names the first failing patch.
+1. `tool/patch.sh apply <target> --profile <name>` names the first failing patch.
 2. Try `git -C <target> apply --3way <patch>`. The patch files keep `index` lines, but a shallow
    consumer checkout may not have the preimage blobs; if `--3way` cannot run, use
    `git apply --reject` (or `patch -p1`) and resolve the `.rej` hunks by hand.
-3. Commit the resolved state in a scratch branch that already has the earlier patches.
+3. Commit the resolved state in a scratch branch that already has the earlier patches of the
+   same profile.
 4. Regenerate the patch as the diff of that commit against its parent:
    `git diff <parent> <commit> > patches/<layer>/<name>.patch`.
-5. Re-run `tool/test.sh`.
+5. Re-run `tool/test.sh --profile <name>`.
 
 A core bump that breaks several patches is a signal to check whether upstream fixed the problem
 and the patch can be deleted.
@@ -211,4 +220,4 @@ patch, and several of them were originally adapted from
 XDRIVE carries MPL-2.0 headers from Xray-core. Detailed credits are in [CREDITS.md](CREDITS.md).
 
 The patches are provided as-is. They are not a claim that the resulting binary is identical to
-stock mihomo: the host layer deliberately changes lifecycle and can change the selected outbound.
+stock mihomo: the host layers deliberately change lifecycle and can change the selected outbound.
