@@ -1,0 +1,297 @@
+mihomo-patch-core: reclash/0013-udp-443
+Source: Prizrak-Core 8076d9ae (GPL-3.0); udp-443 / quic REJECT option.
+
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index 050e244..ddce68d 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -202,6 +202,8 @@ type BasicOption struct {
+ 	RoutingMark int         `proxy:"routing-mark,omitempty"`
+ 	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
+ 	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
++	Udp443      string      `proxy:"udp-443,omitempty"`      // "allow" (default) or "reject": send UDP port 443 (QUIC) traffic into REJECT
++	Quic        string      `proxy:"quic,omitempty"`         // alias of udp-443
+ 
+ 	// FragmentOpts splits the first TLS ClientHello of every TCP connection of
+ 	// this proxy (ClashFest core patch 0033, from Rerowros/veles); off when empty.
+diff --git a/adapter/outbound/udp443.go b/adapter/outbound/udp443.go
+new file mode 100644
+index 0000000..7653c1b
+--- /dev/null
++++ b/adapter/outbound/udp443.go
+@@ -0,0 +1,34 @@
++package outbound
++
++import (
++	"context"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++// udp-443 option values.
++const (
++	Udp443Allow  = "allow"  // default, do nothing
++	Udp443Reject = "reject" // send UDP port 443 traffic (e.g. QUIC) that would go through this proxy into REJECT
++)
++
++// Udp443 is a ProxyAdapter wrapper controlled by the `udp-443` option.
++type Udp443 struct {
++	ProxyAdapter
++	mode string
++}
++
++// ListenPacketContext implements C.ProxyAdapter.
++func (u *Udp443) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
++	if u.mode == Udp443Reject && metadata.NetWork == C.UDP && metadata.DstPort == 443 {
++		return NewReject().ListenPacketContext(ctx, metadata)
++	}
++	return u.ProxyAdapter.ListenPacketContext(ctx, metadata)
++}
++
++func NewUdp443(adapter ProxyAdapter, mode string) *Udp443 {
++	return &Udp443{
++		ProxyAdapter: adapter,
++		mode:         mode,
++	}
++}
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 0791a7b..5fa5509 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -291,6 +291,15 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 	}
+ 
+ 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
++	if err := decoder.Decode(mapping, &basicOption); err == nil {
++		udp443, err := resolveUdp443(basicOption.Udp443, basicOption.Quic)
++		if err != nil {
++			return nil, err
++		}
++		if udp443 == outbound.Udp443Reject {
++			proxy = outbound.NewUdp443(proxy, udp443)
++		}
++	}
+ 	parsed := NewProxy(proxy)
+ 	parsed.routeFingerprint = proxyRouteFingerprint(mapping)
+ 	parsed.endpointFingerprint = proxyEndpointFingerprint(mapping)
+@@ -300,6 +309,24 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 	return parsed, nil
+ }
+ 
++// resolveUdp443 merges the udp-443 option with its `quic` alias.
++func resolveUdp443(udp443, quic string) (string, error) {
++	for _, v := range []string{udp443, quic} {
++		switch v {
++		case "", outbound.Udp443Allow, outbound.Udp443Reject:
++		default:
++			return "", fmt.Errorf("unsupport udp-443 value: %s", v)
++		}
++	}
++	if udp443 != "" && quic != "" && udp443 != quic {
++		return "", fmt.Errorf("conflicting udp-443 and quic values: %q != %q", udp443, quic)
++	}
++	if udp443 == "" {
++		return quic, nil
++	}
++	return udp443, nil
++}
++
+ // The camelCase and kebab spellings are what other clients' subscriptions already carry.
+ var descriptionKeys = []string{"desc", "description", "serverDescription", "server-description"}
+ 
+diff --git a/adapter/parser_udp443_test.go b/adapter/parser_udp443_test.go
+new file mode 100644
+index 0000000..742a596
+--- /dev/null
++++ b/adapter/parser_udp443_test.go
+@@ -0,0 +1,106 @@
++package adapter
++
++import (
++	"context"
++	"net/netip"
++	"strings"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++// dialTestUDP opens a test packet conn through the proxy on the given dst port
++// and returns the outbound chain it ends up on.
++func dialTestUDP(t *testing.T, proxy C.Proxy, port uint16) (string, error) {
++	t.Helper()
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		DstIP:   netip.MustParseAddr("127.0.0.1"),
++		DstPort: port,
++	}
++	pc, err := proxy.ListenPacketContext(context.Background(), metadata)
++	if err != nil {
++		return "", err
++	}
++	defer func() { _ = pc.Close() }()
++	return pc.Chains().String(), nil
++}
++
++// Default (allow): traffic passes through to the outbound untouched.
++func TestParseProxyUdp443DefaultAllow(t *testing.T) {
++	proxy, err := ParseProxy(map[string]any{"name": "d", "type": "direct"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	chain, err := dialTestUDP(t, proxy, 443)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(chain, "REJECT") {
++		t.Fatalf("udp-443 default \"allow\" must route through the outbound, chain: %s", chain)
++	}
++}
++
++// udp-443: reject and its `quic` alias send UDP 443 into REJECT and leave
++// other ports alone.
++func TestParseProxyUdp443Reject(t *testing.T) {
++	for _, mapping := range []map[string]any{
++		{"name": "d", "type": "direct", "udp-443": "reject"},
++		{"name": "d", "type": "direct", "quic": "reject"},
++		// the `quic` alias agrees with udp-443
++		{"name": "d", "type": "direct", "udp-443": "reject", "quic": "reject"},
++		// the structure decoder replaces "_" with "-" in keys
++		{"name": "d", "type": "direct", "udp_443": "reject"},
++	} {
++		proxy, err := ParseProxy(mapping)
++		if err != nil {
++			t.Fatal(err)
++		}
++		chain, err := dialTestUDP(t, proxy, 443)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !strings.Contains(chain, "REJECT") {
++			t.Fatalf("option %v: UDP 443 must go to REJECT, chain: %s", mapping, chain)
++		}
++
++		chain, err = dialTestUDP(t, proxy, 853)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if strings.Contains(chain, "REJECT") {
++			t.Fatalf("option %v: UDP not on port 443 must pass through, chain: %s", mapping, chain)
++		}
++	}
++}
++
++// quic: allow explicitly keeps the default behavior.
++func TestParseProxyUdp443ExplicitAllow(t *testing.T) {
++	for _, key := range []string{"udp-443", "quic"} {
++		proxy, err := ParseProxy(map[string]any{"name": "d", "type": "direct", key: "allow"})
++		if err != nil {
++			t.Fatal(err)
++		}
++		chain, err := dialTestUDP(t, proxy, 443)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if strings.Contains(chain, "REJECT") {
++			t.Fatalf("%s: allow must route through the outbound, chain: %s", key, chain)
++		}
++	}
++}
++
++func TestParseProxyUdp443Invalid(t *testing.T) {
++	for _, mapping := range []map[string]any{
++		{"name": "d", "type": "direct", "udp-443": "drop"},
++		{"name": "d", "type": "direct", "quic": "drop"},
++		// conflicting alias values
++		{"name": "d", "type": "direct", "udp-443": "reject", "quic": "allow"},
++		{"name": "d", "type": "direct", "udp-443": "allow", "quic": "reject"},
++	} {
++		if _, err := ParseProxy(mapping); err == nil {
++			t.Fatalf("invalid option must be rejected: %v", mapping)
++		}
++	}
++}
+diff --git a/adapter/provider/override.go b/adapter/provider/override.go
+index f4353c4..3bca64a 100644
+--- a/adapter/provider/override.go
++++ b/adapter/provider/override.go
+@@ -20,6 +20,8 @@ type overrideSchema struct {
+ 	Interface      *string `provider:"interface-name,omitempty"`
+ 	RoutingMark    *int    `provider:"routing-mark,omitempty"`
+ 	IPVersion      *string `provider:"ip-version,omitempty"`
++	Udp443         *string `provider:"udp-443,omitempty"`
++	Quic           *string `provider:"quic,omitempty"` // alias of udp-443
+ 
+ 	AdditionalPrefix *string                   `provider:"additional-prefix,omitempty"`
+ 	AdditionalSuffix *string                   `provider:"additional-suffix,omitempty"`
+@@ -73,6 +75,12 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
+ 	if o.IPVersion != nil {
+ 		mapping["ip-version"] = *o.IPVersion
+ 	}
++	if o.Udp443 != nil {
++		mapping["udp-443"] = *o.Udp443
++	}
++	if o.Quic != nil {
++		mapping["quic"] = *o.Quic
++	}
+ 
+ 	for _, expr := range o.ProxyName {
+ 		name := mapping["name"].(string)
+diff --git a/adapter/provider/override_udp443_test.go b/adapter/provider/override_udp443_test.go
+new file mode 100644
+index 0000000..49f5176
+--- /dev/null
++++ b/adapter/provider/override_udp443_test.go
+@@ -0,0 +1,52 @@
++package provider
++
++import (
++	"testing"
++
++	"github.com/metacubex/mihomo/common/structure"
++)
++
++// TestOverrideUdp443 checks that `udp-443` and its `quic` alias are part of
++// the provider override whitelist and are put into the proxy mapping before
++// parse, so adapter.ParseProxy applies them.
++func TestOverrideUdp443(t *testing.T) {
++	decoder := structure.NewDecoder(structure.Option{TagName: "provider", WeaklyTypedInput: true})
++	var schema overrideSchema
++	err := decoder.Decode(map[string]any{
++		"udp-443": "reject",
++		"quic":    "allow",
++	}, &schema)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	mapping := map[string]any{"name": "p"}
++	if err := schema.Apply(mapping); err != nil {
++		t.Fatal(err)
++	}
++	if mapping["udp-443"] != "reject" {
++		t.Fatalf("udp-443 override not applied: %#v", mapping["udp-443"])
++	}
++	if mapping["quic"] != "allow" {
++		t.Fatalf("quic override not applied: %#v", mapping["quic"])
++	}
++}
++
++// Unknown override keys stay ignored, so an unset alias doesn't fake a value.
++func TestOverrideUdp443Unset(t *testing.T) {
++	decoder := structure.NewDecoder(structure.Option{TagName: "provider", WeaklyTypedInput: true})
++	var schema overrideSchema
++	if err := decoder.Decode(map[string]any{
++		"udp-443": "reject",
++	}, &schema); err != nil {
++		t.Fatal(err)
++	}
++
++	mapping := map[string]any{"name": "p"}
++	if err := schema.Apply(mapping); err != nil {
++		t.Fatal(err)
++	}
++	if _, exist := mapping["quic"]; exist {
++		t.Fatalf("unset quic must not appear in mapping: %#v", mapping["quic"])
++	}
++}

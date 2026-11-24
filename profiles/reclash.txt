@@ -12,3 +12,9 @@ reclash/0009-direct-split.patch
 reclash/0010-geo-digest.patch
 reclash/0011-listener-plumbing.patch
 reclash/0012-controller-serve-log.patch
+reclash/0013-udp-443.patch
+reclash/0014-random-mlkem.patch
+reclash/0015-fallback-urls.patch
+reclash/0016-xhttp-h2-flow.patch
+reclash/0017-reality-password.patch
+reclash/0018-ping-config.patch

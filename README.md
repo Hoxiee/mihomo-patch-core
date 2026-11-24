@@ -97,7 +97,7 @@ ships with. Tests that need an Xray binary or external network skip themselves.
 |---|---:|---|
 | `core` | 38 | xray 35 + diagnostics 3 |
 | `flclash` | 40 | core + FlClash host 1 + feature.Android adaptation 1 |
-| `reclash` | 52 | flclash + ReClash 12 |
+| `reclash` | 59 | flclash + ReClash 19 |
 
 `core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
 is what the ReClash application consumes.
@@ -120,12 +120,19 @@ The former `feat: support ReClash` commit is one concern per patch:
 | `0010-geo-digest` | skip a geo database body when the published digest matches |
 | `0011-listener-plumbing` | duplicate close removal and injectable TUN stack |
 | `0012-controller-serve-log` | log external-controller serve errors |
+| `0013-udp-443` | reject QUIC (UDP/443) per proxy or provider |
+| `0014-random-mlkem` | randomized/random ClientHellos always offer X25519MLKEM768; random no longer picks iOS |
+| `0015-fallback-urls` | mirror addresses for HTTP proxy and rule providers |
+| `0016-xhttp-h2-flow` | HTTP/2 downlink flow governor for XHTTP |
+| `0017-reality-password` | Xray's `reality-opts.password` alias for `public-key` |
+| `0018-ping-config` | real-download ping checks with sampling, without the smart group |
 
 ### Xray coverage
 
 - **REALITY and TLS** — configurable global and per-proxy client version, adaptive
-  X25519MLKEM768 policy with a per-server memo (modern-first, classic fallback), ML-DSA-65
-  verification, Xray fingerprint names, comma-separated certificate pins and name lists, ECH
+  X25519MLKEM768 policy with a per-server memo (modern-first, classic fallback), the Xray
+  `password` alias, ML-DSA-65 verification, Xray fingerprint names, comma-separated certificate
+  pins and name lists, ECH
   PEM/query forms, Chrome 155, Firefox 156/160, and Xray's
   current defaults: `chrome` = Chrome 155, `firefox` = Firefox 160; `chrome133` and `firefox148`
   keep the older mihomo parrots.
@@ -134,8 +141,11 @@ The former `feat: support ReClash` commit is one concern per patch:
   (not just the fragment mask), and Trojan REALITY links (`pbk`, `sid`, `pqv`). UDP masks are
   kept only for VLESS over XHTTP with `alpn: h3`.
 - **XHTTP** — default uplink data key, per-direction read/write deadlines, pipelined packet-up
-  uploads with an 8-seq window.
+  uploads with an 8-seq window, and the HTTP/2 flow governor (`h2-flow` / `h2-flow-control`).
 - **mux.cool** — VLESS Mux.Cool and XUDP client with carrier limits.
+- **udp-443** — per-proxy and provider-override QUIC rejection.
+- **providers** — `fallback-urls` for HTTP proxy and rule providers.
+- **health checks** — `ping-config` with a destination check, sampling, and screen-aware scheduling.
 - **XDRIVE** — VLESS over Google Drive, template storage or a local folder; the local service is
   disabled on Android.
 - **finalmask** — Xray masks on VLESS and Trojan (`fragment`, `header-custom`, `sudoku`, `xmc`,

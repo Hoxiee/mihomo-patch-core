@@ -1,0 +1,275 @@
+mihomo-patch-core: reclash/0014-random-mlkem
+Source: Prizrak-Core a44096ba and a9e5c456 (GPL-3.0); randomized hello and random fingerprint fixes.
+
+diff --git a/component/tls/chrome155.go b/component/tls/chrome155.go
+index 8310682..174399e 100644
+--- a/component/tls/chrome155.go
++++ b/component/tls/chrome155.go
+@@ -226,5 +226,17 @@ func uClient(c net.Conn, config *utls.Config, fingerprint UClientHelloID) *UConn
+ 		log.Warnln("%s %s fingerprint: %v, falling back to %s", fingerprint.Client, fingerprint.Version, err, fallback.Version)
+ 		fingerprint = fallback
+ 	}
+-	return utls.UClient(c, config, fingerprint)
++	return buildRandomizedUClient(c, config, fingerprint)
++}
++
++// buildRandomizedUClient removes the P-256 key share from a randomized hello
++// before the caller builds the handshake.
++func buildRandomizedUClient(c net.Conn, config *utls.Config, fingerprint UClientHelloID) *UConn {
++	uConn := utls.UClient(c, config, fingerprint)
++	if isRandomized(fingerprint) {
++		if err := uConn.BuildHandshakeState(); err == nil {
++			_ = DropRandomizedP256KeyShare(uConn)
++		}
++	}
++	return uConn
+ }
+diff --git a/component/tls/randomized_test.go b/component/tls/randomized_test.go
+new file mode 100644
+index 0000000..ce2a4de
+--- /dev/null
++++ b/component/tls/randomized_test.go
+@@ -0,0 +1,152 @@
++package tls
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	gotls "crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"math/big"
++	"net"
++	"testing"
++	"time"
++
++	utls "github.com/metacubex/utls"
++	"github.com/stretchr/testify/assert"
++	"golang.org/x/exp/slices"
++)
++
++func randomizedWithSeed(t *testing.T) UClientHelloID {
++	fingerprint := utls.HelloRandomized
++	seed, err := utls.NewPRNGSeed()
++	if !assert.NoError(t, err) {
++		t.FailNow()
++	}
++	fingerprint.Seed = seed
++	fingerprint.Weights = &randomizedWeights
++	return fingerprint
++}
++
++func helloGroups(uConn *UConn) (curves []utls.CurveID, shares []utls.CurveID) {
++	for _, extension := range uConn.Extensions {
++		switch ext := extension.(type) {
++		case *utls.SupportedCurvesExtension:
++			curves = append(curves, ext.Curves...)
++		case *utls.KeyShareExtension:
++			for _, share := range ext.KeyShares {
++				shares = append(shares, share.Group)
++			}
++		}
++	}
++	return
++}
++
++// Every process's "randomized" hello offers X25519MLKEM768 with its key share,
++// sends key shares for X25519MLKEM768 and X25519 only, and no key share for a
++// group it does not offer.
++func TestRandomizedHelloAlwaysOffersMLKEMWithItsKeyShare(t *testing.T) {
++	for i := 0; i < 200; i++ {
++		client, server := net.Pipe()
++		uConn := UClient(client, &utls.Config{ServerName: "example.com"}, randomizedWithSeed(t))
++		curves, shares := helloGroups(uConn)
++		_ = client.Close()
++		_ = server.Close()
++		var classical []utls.CurveID
++		for _, share := range shares {
++			if share>>8 == 0x0a && share&0xff == 0x0a { // GREASE
++				continue
++			}
++			classical = append(classical, share)
++			assert.Contains(t, curves, share, "key share for a group that is not offered")
++		}
++		assert.Contains(t, curves, utls.X25519MLKEM768)
++		assert.Equal(t, []utls.CurveID{utls.X25519MLKEM768, utls.X25519}, classical)
++		if t.Failed() {
++			t.Logf("seed %d: groups %v, key shares %v", i, curves, shares)
++			return
++		}
++	}
++}
++
++func selfSignedCert(t *testing.T) gotls.Certificate {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if !assert.NoError(t, err) {
++		t.FailNow()
++	}
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "example.com"},
++		DNSNames:     []string{"example.com"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	if !assert.NoError(t, err) {
++		t.FailNow()
++	}
++	return gotls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++}
++
++// A "randomized" client completes a handshake with a server that prefers the
++// hybrid group and with one that only takes P-256, which asks again.
++func TestRandomizedHelloHandshakes(t *testing.T) {
++	cert := selfSignedCert(t)
++	for name, curves := range map[string][]gotls.CurveID{
++		"default": nil,
++		"P-256":   {gotls.CurveP256},
++		"X25519":  {gotls.X25519},
++	} {
++		curves := curves
++		t.Run(name, func(t *testing.T) {
++			for i := 0; i < 20; i++ {
++				ln, err := net.Listen("tcp", "127.0.0.1:0")
++				if !assert.NoError(t, err) {
++					return
++				}
++				done := make(chan error, 1)
++				go func() {
++					server, err := ln.Accept()
++					if err != nil {
++						done <- err
++						return
++					}
++					conn := gotls.Server(server, &gotls.Config{Certificates: []gotls.Certificate{cert}, CurvePreferences: curves})
++					done <- conn.HandshakeContext(context.Background())
++					_ = conn.Close()
++				}()
++				client, err := net.Dial("tcp", ln.Addr().String())
++				if !assert.NoError(t, err) {
++					return
++				}
++				uConn := UClient(client, &utls.Config{ServerName: "example.com", InsecureSkipVerify: true}, randomizedWithSeed(t))
++				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++				err = uConn.HandshakeContext(ctx)
++				cancel()
++				_ = uConn.Close()
++				serverErr := <-done
++				_ = ln.Close()
++				if !assert.NoError(t, err) || !assert.NoError(t, serverErr) {
++					return
++				}
++			}
++		})
++	}
++}
++
++func TestRandomFingerprintOffersMLKEM(t *testing.T) {
++	for _, name := range []string{"chrome", "safari", "firefox"} {
++		fingerprint, ok := GetFingerprint(name)
++		if !assert.True(t, ok, name) {
++			continue
++		}
++		client, server := net.Pipe()
++		uConn := UClient(client, &utls.Config{ServerName: "example.com"}, fingerprint)
++		assert.NoError(t, uConn.BuildHandshakeState())
++		curves, shares := helloGroups(uConn)
++		_ = client.Close()
++		_ = server.Close()
++		assert.True(t, slices.Contains(curves, utls.X25519MLKEM768) && slices.Contains(shares, utls.X25519MLKEM768), "%s: groups %v, key shares %v", name, curves, shares)
++	}
++}
+diff --git a/component/tls/reality.go b/component/tls/reality.go
+index bf0184e..289692c 100644
+--- a/component/tls/reality.go
++++ b/component/tls/reality.go
+@@ -307,6 +307,9 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if err := DropRandomizedP256KeyShare(uConn); err != nil {
++			return nil, err
++		}
+ 		verifier.UConn = uConn
+ 
+ 		// When the hybrid handshake is wanted (forced, or learned because the
+diff --git a/component/tls/utls.go b/component/tls/utls.go
+index da3b5d9..ffe41f3 100644
+--- a/component/tls/utls.go
++++ b/component/tls/utls.go
+@@ -64,9 +64,10 @@ func GetFingerprint(clientFingerprint string) (UClientHelloID, bool) {
+ 
+ var randomFingerprint = once.OnceValue(func() UClientHelloID {
+ 	chooser, _ := weightedrand.NewChooser(
++		// Only fingerprints that send X25519MLKEM768: Xray's REALITY servers
++		// turn away a hello without it, and "ios" (iOS 14) has none.
+ 		weightedrand.NewChoice("chrome", 6),
+ 		weightedrand.NewChoice("safari", 3),
+-		weightedrand.NewChoice("ios", 2),
+ 		weightedrand.NewChoice("firefox", 1),
+ 	)
+ 	initClient := chooser.Pick()
+@@ -115,16 +116,58 @@ var fingerprints = map[string]UClientHelloID{
+ 	"randomized":                 utls.HelloRandomized,
+ }
+ 
+-func init() {
++// randomizedWeights are the weights of the "randomized" fingerprint. uTLS
++// offers X25519MLKEM768 in supported_groups and sends its key share on two
++// independent draws. The group without its key share makes a server that
++// prefers it ask again, which uTLS cannot answer, and REALITY turns such a
++// hello away; the key share without the group breaks RFC 8446, Section 4.2.8.
++// Both are always drawn, as current browsers send them, as in
++// Jolymmiles/Xray-core. The second weight also adds a P-256 key share, which
++// DropRandomizedP256KeyShare removes. The fingerprint is recognized by the
++// address of these weights.
++var randomizedWeights = func() utls.Weights {
+ 	weights := utls.DefaultWeights
+ 	weights.TLSVersMax_Set_VersionTLS13 = 1
+ 	weights.FirstKeyShare_Set_CurveP256 = 0
++	weights.CurveIDs_Append_X25519 = 1
++	weights.KeyShare_Append_RandomGroups = 1
++	return weights
++}()
++
++func init() {
+ 	randomized := utls.HelloRandomized
+ 	randomized.Seed, _ = utls.NewPRNGSeed()
+-	randomized.Weights = &weights
++	randomized.Weights = &randomizedWeights
+ 	fingerprints["randomized"] = randomized
+ }
+ 
++func isRandomized(fingerprint UClientHelloID) bool {
++	return fingerprint.Weights == &randomizedWeights && fingerprint.Client == utls.HelloRandomized.Client
++}
++
++// DropRandomizedP256KeyShare takes the P-256 key share out of a built
++// "randomized" hello and builds it again: X25519MLKEM768 and X25519 with keys
++// of their own is what Chrome sends, and a server that wants P-256 asks for
++// its key share. It does nothing for other fingerprints.
++func DropRandomizedP256KeyShare(uConn *UConn) error {
++	if !isRandomized(uConn.ClientHelloID) {
++		return nil
++	}
++	for _, extension := range uConn.Extensions {
++		if ks, ok := extension.(*utls.KeyShareExtension); ok {
++			count := len(ks.KeyShares)
++			ks.KeyShares = slices.DeleteFunc(ks.KeyShares, func(share utls.KeyShare) bool {
++				return share.Group == utls.CurveP256
++			})
++			if len(ks.KeyShares) == count {
++				return nil
++			}
++			return uConn.BuildHandshakeState()
++		}
++	}
++	return nil
++}
++
+ type Certificate = utls.Certificate
+ 
+ func UCertificate(it tls.Certificate) utls.Certificate {

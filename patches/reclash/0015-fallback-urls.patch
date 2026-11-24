@@ -1,0 +1,763 @@
+mihomo-patch-core: reclash/0015-fallback-urls
+Source: Prizrak-Core 63de05b7 (GPL-3.0); fallback addresses for HTTP proxy and rule providers.
+
+diff --git a/adapter/provider/parser.go b/adapter/provider/parser.go
+index 5d01793..8fb93dd 100644
+--- a/adapter/provider/parser.go
++++ b/adapter/provider/parser.go
+@@ -38,6 +38,7 @@ type proxyProviderSchema struct {
+ 	SizeLimit     int64            `provider:"size-limit,omitempty"`
+ 	Payload       []map[string]any `provider:"payload,omitempty"`
+ 	AgeSecretKey  string           `provider:"age-secret-key,omitempty"`
++	FallbackURLs  []string         `provider:"fallback-urls,omitempty"`
+ 
+ 	HealthCheck healthCheckSchema   `provider:"health-check,omitempty"`
+ 	Override    overrideSchema      `provider:"override,omitempty"`
+@@ -91,7 +92,15 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
+ 				return nil, C.Path.ErrNotSafePath(path)
+ 			}
+ 		}
+-		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit)
++		fallbackURLs, err := resource.ParseFallbackURLs(schema.URL, schema.FallbackURLs)
++		if err != nil {
++			return nil, err
++		}
++		var options []resource.HTTPVehicleOption
++		if len(fallbackURLs) > 0 {
++			options = append(options, resource.WithFallbackURLs(name, fallbackURLs))
++		}
++		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit, options...)
+ 	case "inline":
+ 		return NewInlineProvider(name, schema.Payload, parser, hc)
+ 	default:
+diff --git a/adapter/provider/parser_fallback_test.go b/adapter/provider/parser_fallback_test.go
+new file mode 100644
+index 0000000..908740d
+--- /dev/null
++++ b/adapter/provider/parser_fallback_test.go
+@@ -0,0 +1,66 @@
++package provider
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// A proxy-provider with fallback-urls reads the subscription, and its
++// subscription-userinfo, from the first address that answers.
++func TestParseProxyProviderFallbackURLs(t *testing.T) {
++	C.SetHomeDir(t.TempDir())
++	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("subscription-userinfo", "upload=1; download=1; total=1; expire=1")
++		w.WriteHeader(502)
++	}))
++	defer main.Close()
++	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("subscription-userinfo", "upload=10; download=20; total=300; expire=0")
++		_, _ = w.Write([]byte("proxies:\n  - {name: a, type: socks5, server: 127.0.0.1, port: 1080}\n"))
++	}))
++	defer backup.Close()
++
++	p, err := ParseProxyProvider("sub", map[string]any{
++		"type":          "http",
++		"url":           main.URL + "/sub?token=x",
++		"fallback-urls": []any{backup.URL + "/sub?token=x"},
++		"path":          "./proxies/sub.yaml",
++	}, nil)
++	require.NoError(t, err)
++	defer p.(*ProxySetProvider).Close()
++	require.NoError(t, p.Initial())
++	require.Len(t, p.Proxies(), 1)
++	assert.Equal(t, "a", p.Proxies()[0].Name())
++	assert.Equal(t, &SubscriptionInfo{Upload: 10, Download: 20, Total: 300}, p.(*ProxySetProvider).subscriptionInfo)
++	body, err := p.(*ProxySetProvider).MarshalJSON()
++	require.NoError(t, err)
++	assert.Contains(t, string(body), `"lastUrl":"`+backup.URL+`/sub"`)
++	assert.NotContains(t, string(body), "token")
++}
++
++func TestParseProxyProviderBadFallbackURL(t *testing.T) {
++	C.SetHomeDir(t.TempDir())
++	_, err := ParseProxyProvider("sub", map[string]any{
++		"type":          "http",
++		"url":           "https://example.com/sub",
++		"fallback-urls": []any{"https://mirror.example/sub", "socks5://mirror.example/sub"},
++	}, nil)
++	assert.ErrorContains(t, err, "fallback-urls")
++}
++
++// Without fallback-urls the provider API shows no lastUrl.
++func TestParseProxyProviderWithoutFallbackHasNoLastURL(t *testing.T) {
++	C.SetHomeDir(t.TempDir())
++	p, err := ParseProxyProvider("sub", map[string]any{"type": "http", "url": "https://example.com/sub"}, nil)
++	require.NoError(t, err)
++	defer p.(*ProxySetProvider).Close()
++	body, err := p.(*ProxySetProvider).MarshalJSON()
++	require.NoError(t, err)
++	assert.NotContains(t, string(body), "lastUrl")
++}
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+index 95d952e..c9dc0c4 100644
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -41,6 +41,7 @@ type providerForApi struct {
+ 	ExpectedStatus   string            `json:"expectedStatus"`
+ 	UpdatedAt        time.Time         `json:"updatedAt,omitempty"`
+ 	SubscriptionInfo *SubscriptionInfo `json:"subscriptionInfo,omitempty"`
++	LastUrl          string            `json:"lastUrl,omitempty"`
+ }
+ 
+ type baseProvider struct {
+@@ -137,6 +138,7 @@ func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
+ 		ExpectedStatus:   pp.healthCheck.expectedStatus.String(),
+ 		UpdatedAt:        pp.UpdatedAt(),
+ 		SubscriptionInfo: pp.subscriptionInfo,
++		LastUrl:          resource.LastURL(pp.Vehicle()),
+ 	})
+ }
+ 
+diff --git a/component/resource/vehicle.go b/component/resource/vehicle.go
+index 86fb394..f54affb 100644
+--- a/component/resource/vehicle.go
++++ b/component/resource/vehicle.go
+@@ -3,15 +3,20 @@ package resource
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
++	URL "net/url"
+ 	"os"
+ 	"path/filepath"
++	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+ 	mihomoHttp "github.com/metacubex/mihomo/component/http"
+ 	"github.com/metacubex/mihomo/component/profile/cachefile"
+ 	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/metacubex/mihomo/log"
+ 
+ 	"github.com/metacubex/http"
+ )
+@@ -93,12 +98,99 @@ type HTTPVehicle struct {
+ 	sizeLimit int64
+ 	inRead    func(response *http.Response)
+ 	provider  P.ProxyProvider
++
++	// fallbackURLs are tried in order after url, each with a timeout of
++	// its own; name is the provider they belong to, for the log.
++	fallbackURLs []string
++	name         string
++	lastURL      atomic.Value // string, the address that answered last
++}
++
++// HTTPVehicleOption sets what a vehicle has beyond its address.
++type HTTPVehicleOption func(h *HTTPVehicle)
++
++// WithFallbackURLs gives the vehicle addresses to try in order when the
++// main one does not answer. The provider name goes to the log.
++func WithFallbackURLs(provider string, urls []string) HTTPVehicleOption {
++	return func(h *HTTPVehicle) {
++		h.name = provider
++		h.fallbackURLs = urls
++	}
++}
++
++// ParseFallbackURLs checks the fallback-urls of a provider: http and
++// https only, with empty entries skipped and repeats of the main url and
++// of each other dropped.
++func ParseFallbackURLs(main string, urls []string) ([]string, error) {
++	var out []string
++	seen := map[string]bool{main: true}
++	for i, raw := range urls {
++		raw = strings.TrimSpace(raw)
++		if raw == "" || seen[raw] {
++			continue
++		}
++		u, err := URL.Parse(raw)
++		if err != nil {
++			return nil, fmt.Errorf("fallback-urls: entry %d is not a valid address", i+1)
++		}
++		if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" || u.Host == "" {
++			return nil, fmt.Errorf("fallback-urls: %s is not an http or https address", logURL(raw))
++		}
++		seen[raw] = true
++		out = append(out, raw)
++	}
++	return out, nil
++}
++
++// logURL is an address fit for the log: no user info and no query, where
++// subscription tokens live.
++func logURL(raw string) string {
++	u, err := URL.Parse(raw)
++	if err != nil {
++		return "<invalid url>"
++	}
++	u.User = nil
++	u.RawQuery = ""
++	u.ForceQuery = false
++	u.Fragment = ""
++	u.RawFragment = ""
++	return u.String()
++}
++
++// reason is the error of an attempt without the address, which a request
++// error repeats with its query.
++func reason(err error) error {
++	var urlErr *URL.Error
++	if errors.As(err, &urlErr) {
++		return urlErr.Err
++	}
++	return err
+ }
+ 
+ func (h *HTTPVehicle) Url() string {
+ 	return h.url
+ }
+ 
++// LastURL is the address that answered the last read, when the vehicle has
++// fallback addresses; otherwise it is empty.
++func (h *HTTPVehicle) LastURL() string {
++	if s, ok := h.lastURL.Load().(string); ok {
++		return s
++	}
++	return ""
++}
++
++// LastURL is the address an http vehicle with fallback addresses read
++// last, without its query, for the API; empty for every other vehicle.
++func LastURL(vehicle P.Vehicle) string {
++	if h, ok := vehicle.(*HTTPVehicle); ok {
++		if last := h.LastURL(); last != "" {
++			return logURL(last)
++		}
++	}
++	return ""
++}
++
+ func (h *HTTPVehicle) Type() P.VehicleType {
+ 	return P.HTTP
+ }
+@@ -120,12 +212,38 @@ func (h *HTTPVehicle) SetInRead(fn func(response *http.Response)) {
+ }
+ 
+ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []byte, hash utils.HashType, err error) {
++	if len(h.fallbackURLs) == 0 {
++		return h.readURL(ctx, h.url, oldHash, false)
++	}
++	urls := append([]string{h.url}, h.fallbackURLs...)
++	reasons := make([]string, 0, len(urls))
++	for i, url := range urls {
++		buf, hash, err = h.readURL(ctx, url, oldHash, true)
++		if err == nil {
++			h.lastURL.Store(url)
++			return
++		}
++		reasons = append(reasons, fmt.Sprintf("%s: %s", logURL(url), reason(err)))
++		if ctx.Err() != nil {
++			break
++		}
++		if i+1 < len(urls) {
++			log.Warnln("[Provider] %s: %s did not answer (%s), trying %s", h.name, logURL(url), reason(err), logURL(urls[i+1]))
++		}
++	}
++	return nil, utils.HashType{}, fmt.Errorf("no address answered: %s", strings.Join(reasons, "; "))
++}
++
++// readURL reads one address with a timeout of its own. With fallback
++// addresses, inRead sees only the response that answered; a lone address
++// keeps showing it every response, as before.
++func (h *HTTPVehicle) readURL(ctx context.Context, url string, oldHash utils.HashType, fallback bool) (buf []byte, hash utils.HashType, err error) {
+ 	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+ 	defer cancel()
+ 	header := h.header
+ 	setIfNoneMatch := false
+ 	if etag && oldHash.IsValid() {
+-		etagWithHash := cachefile.Cache().GetETagWithHash(h.url)
++		etagWithHash := cachefile.Cache().GetETagWithHash(url)
+ 		if oldHash.Equal(etagWithHash.Hash) && etagWithHash.ETag != "" {
+ 			if header == nil {
+ 				header = http.Header{}
+@@ -136,18 +254,21 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 			setIfNoneMatch = true
+ 		}
+ 	}
+-	resp, err := mihomoHttp.HttpRequest(ctx, h.url, http.MethodGet, header, nil, mihomoHttp.WithSpecialProxy(h.proxy))
++	resp, err := mihomoHttp.HttpRequest(ctx, url, http.MethodGet, header, nil, mihomoHttp.WithSpecialProxy(h.proxy))
+ 	if err != nil {
+ 		return
+ 	}
+ 	defer resp.Body.Close()
+ 
+-	if h.inRead != nil {
++	if h.inRead != nil && !fallback {
+ 		h.inRead(resp)
+ 	}
+ 
+ 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+ 		if setIfNoneMatch && resp.StatusCode == http.StatusNotModified {
++			if h.inRead != nil && fallback {
++				h.inRead(resp)
++			}
+ 			return nil, oldHash, nil
+ 		}
+ 		err = errors.New(resp.Status)
+@@ -161,9 +282,12 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 	if err != nil {
+ 		return
+ 	}
++	if h.inRead != nil && fallback {
++		h.inRead(resp)
++	}
+ 	hash = utils.MakeHash(buf)
+ 	if etag {
+-		cachefile.Cache().SetETagWithHash(h.url, cachefile.EtagWithHash{
++		cachefile.Cache().SetETagWithHash(url, cachefile.EtagWithHash{
+ 			Hash: hash,
+ 			ETag: resp.Header.Get("ETag"),
+ 			Time: time.Now(),
+@@ -172,8 +296,8 @@ func (h *HTTPVehicle) Read(ctx context.Context, oldHash utils.HashType) (buf []b
+ 	return
+ }
+ 
+-func NewHTTPVehicle(url string, path string, proxy string, header http.Header, timeout time.Duration, sizeLimit int64) *HTTPVehicle {
+-	return &HTTPVehicle{
++func NewHTTPVehicle(url string, path string, proxy string, header http.Header, timeout time.Duration, sizeLimit int64, options ...HTTPVehicleOption) *HTTPVehicle {
++	h := &HTTPVehicle{
+ 		url:       url,
+ 		path:      path,
+ 		proxy:     proxy,
+@@ -181,4 +305,8 @@ func NewHTTPVehicle(url string, path string, proxy string, header http.Header, t
+ 		timeout:   timeout,
+ 		sizeLimit: sizeLimit,
+ 	}
++	for _, option := range options {
++		option(h)
++	}
++	return h
+ }
+diff --git a/component/resource/vehicle_test.go b/component/resource/vehicle_test.go
+new file mode 100644
+index 0000000..5bf6a35
+--- /dev/null
++++ b/component/resource/vehicle_test.go
+@@ -0,0 +1,274 @@
++package resource
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/common/utils"
++	"github.com/metacubex/mihomo/component/profile/cachefile"
++	C "github.com/metacubex/mihomo/constant"
++
++	mhttp "github.com/metacubex/http"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestMain(m *testing.M) {
++	dir, err := os.MkdirTemp("", "vehicle-test")
++	if err != nil {
++		panic(err)
++	}
++	C.SetHomeDir(dir)
++	code := m.Run()
++	cachefile.Cache().Close()
++	os.RemoveAll(dir)
++	os.Exit(code)
++}
++
++// mirror is a test address answering with a status and a body, counting
++// the requests it got.
++type mirror struct {
++	*httptest.Server
++	hits atomic.Int32
++}
++
++func newMirror(t *testing.T, handler http.HandlerFunc) *mirror {
++	m := &mirror{}
++	m.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		m.hits.Add(1)
++		handler(w, r)
++	}))
++	t.Cleanup(m.Close)
++	return m
++}
++
++func status(code int, body string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(code)
++		_, _ = w.Write([]byte(body))
++	}
++}
++
++// closedURL is an address nothing listens on.
++func closedURL(t *testing.T) string {
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	addr := l.Addr().String()
++	require.NoError(t, l.Close())
++	return "http://" + addr + "/rules.yaml"
++}
++
++func vehicle(main string, timeout time.Duration, fallbacks ...string) *HTTPVehicle {
++	var options []HTTPVehicleOption
++	if len(fallbacks) > 0 {
++		options = append(options, WithFallbackURLs("test", fallbacks))
++	}
++	return NewHTTPVehicle(main, "", "", nil, timeout, 0, options...)
++}
++
++func TestHTTPVehicleFallbackOnServerError(t *testing.T) {
++	main := newMirror(t, status(500, "main"))
++	backup := newMirror(t, status(200, "backup"))
++	buf, _, err := vehicle(main.URL, time.Second, backup.URL).Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	assert.Equal(t, "backup", string(buf))
++	assert.EqualValues(t, 1, main.hits.Load())
++}
++
++func TestHTTPVehicleFallbackOnClosedPort(t *testing.T) {
++	backup := newMirror(t, status(200, "backup"))
++	h := vehicle(closedURL(t), time.Second, backup.URL)
++	buf, _, err := h.Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	assert.Equal(t, "backup", string(buf))
++	assert.Equal(t, backup.URL, h.LastURL())
++}
++
++func TestHTTPVehicleFallbackInOrder(t *testing.T) {
++	main := newMirror(t, status(404, "main"))
++	first := newMirror(t, status(502, "first"))
++	second := newMirror(t, status(200, "second"))
++	buf, _, err := vehicle(main.URL, time.Second, first.URL, second.URL).Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	assert.Equal(t, "second", string(buf))
++	assert.EqualValues(t, 1, main.hits.Load())
++	assert.EqualValues(t, 1, first.hits.Load())
++	assert.EqualValues(t, 1, second.hits.Load())
++}
++
++func TestHTTPVehicleAllFail(t *testing.T) {
++	main := newMirror(t, status(500, ""))
++	backup := newMirror(t, status(403, ""))
++	_, _, err := vehicle(main.URL+"/sub?token=secret", time.Second, backup.URL+"/sub?token=secret").Read(context.Background(), utils.HashType{})
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), main.URL+"/sub: 500")
++	assert.Contains(t, err.Error(), backup.URL+"/sub: 403")
++	closed := closedURL(t)
++	_, _, err = vehicle(closed+"?token=secret", time.Second, backup.URL).Read(context.Background(), utils.HashType{})
++	require.Error(t, err)
++	assert.NotContains(t, err.Error(), "secret")
++}
++
++func withETag(t *testing.T) {
++	old := ETag()
++	SetETag(true)
++	t.Cleanup(func() { SetETag(old) })
++}
++
++func etagHandler(tag, body string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("If-None-Match") == tag {
++			w.WriteHeader(http.StatusNotModified)
++			return
++		}
++		w.Header().Set("ETag", tag)
++		_, _ = w.Write([]byte(body))
++	}
++}
++
++// 304 from the main address keeps the old data and asks no fallback.
++func TestHTTPVehicleNotModifiedStops(t *testing.T) {
++	withETag(t)
++	main := newMirror(t, etagHandler(`"main-v1"`, "main"))
++	backup := newMirror(t, status(200, "backup"))
++	h := vehicle(main.URL+"/304", time.Second, backup.URL)
++	buf, hash, err := h.Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	require.Equal(t, "main", string(buf))
++
++	buf, newHash, err := h.Read(context.Background(), hash)
++	require.NoError(t, err)
++	assert.Nil(t, buf)
++	assert.True(t, hash.Equal(newHash))
++	assert.EqualValues(t, 2, main.hits.Load())
++	assert.EqualValues(t, 0, backup.hits.Load())
++}
++
++// The ETag lives under the address that answered, the main one keeping
++// its old key.
++func TestHTTPVehicleETagPerAddress(t *testing.T) {
++	withETag(t)
++	fail := atomic.Bool{}
++	main := newMirror(t, func(w http.ResponseWriter, r *http.Request) {
++		if fail.Load() {
++			w.WriteHeader(500)
++			return
++		}
++		etagHandler(`"main-v1"`, "data")(w, r)
++	})
++	backup := newMirror(t, etagHandler(`"backup-v1"`, "data"))
++	mainURL, backupURL := main.URL+"/etag", backup.URL+"/etag"
++	h := vehicle(mainURL, time.Second, backupURL)
++
++	_, hash, err := h.Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	assert.Equal(t, `"main-v1"`, cachefile.Cache().GetETagWithHash(mainURL).ETag)
++	assert.Empty(t, cachefile.Cache().GetETagWithHash(backupURL).ETag)
++
++	fail.Store(true)
++	buf, _, err := h.Read(context.Background(), hash)
++	require.NoError(t, err)
++	assert.Equal(t, "data", string(buf))
++	assert.Equal(t, `"backup-v1"`, cachefile.Cache().GetETagWithHash(backupURL).ETag)
++	assert.Equal(t, `"main-v1"`, cachefile.Cache().GetETagWithHash(mainURL).ETag)
++
++	// The backup's own ETag now answers 304 there.
++	buf, newHash, err := h.Read(context.Background(), hash)
++	require.NoError(t, err)
++	assert.Nil(t, buf)
++	assert.True(t, hash.Equal(newHash))
++}
++
++// Every attempt has a timeout of its own.
++func TestHTTPVehicleTimeoutPerAttempt(t *testing.T) {
++	release := make(chan struct{})
++	t.Cleanup(func() { close(release) })
++	hang := newMirror(t, func(w http.ResponseWriter, r *http.Request) {
++		select {
++		case <-release:
++		case <-r.Context().Done():
++		}
++	})
++	backup := newMirror(t, func(w http.ResponseWriter, r *http.Request) {
++		time.Sleep(200 * time.Millisecond)
++		_, _ = w.Write([]byte("backup"))
++	})
++	timeout := 500 * time.Millisecond
++	start := time.Now()
++	buf, _, err := vehicle(hang.URL, timeout, backup.URL).Read(context.Background(), utils.HashType{})
++	elapsed := time.Since(start)
++	require.NoError(t, err)
++	assert.Equal(t, "backup", string(buf))
++	assert.GreaterOrEqual(t, elapsed, timeout)
++	assert.Less(t, elapsed, timeout+200*time.Millisecond+500*time.Millisecond)
++}
++
++// A cancelled read tries no further address.
++func TestHTTPVehicleCancelStops(t *testing.T) {
++	backup := newMirror(t, status(200, "backup"))
++	hang := newMirror(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
++	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++	defer cancel()
++	_, _, err := vehicle(hang.URL, 5*time.Second, backup.URL).Read(ctx, utils.HashType{})
++	require.Error(t, err)
++	assert.EqualValues(t, 0, backup.hits.Load())
++}
++
++// inRead sees the response of the address that answered.
++func TestHTTPVehicleInReadAnsweringAddress(t *testing.T) {
++	main := newMirror(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("X-From", "main")
++		w.WriteHeader(500)
++	})
++	backup := newMirror(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("X-From", "backup")
++		_, _ = w.Write([]byte("backup"))
++	})
++	var seen []string
++	h := vehicle(main.URL, time.Second, backup.URL)
++	h.SetInRead(func(resp *mhttp.Response) { seen = append(seen, resp.Header.Get("X-From")) })
++	_, _, err := h.Read(context.Background(), utils.HashType{})
++	require.NoError(t, err)
++	assert.Equal(t, []string{"backup"}, seen)
++}
++
++// Without fallback-urls a read is one request, inRead seeing it whatever
++// it answered, as before.
++func TestHTTPVehicleWithoutFallback(t *testing.T) {
++	main := newMirror(t, status(500, "main"))
++	var seen int
++	h := NewHTTPVehicle(main.URL, "", "", nil, time.Second, 0)
++	h.SetInRead(func(resp *mhttp.Response) { seen++ })
++	_, _, err := h.Read(context.Background(), utils.HashType{})
++	require.EqualError(t, err, "500 Internal Server Error")
++	assert.EqualValues(t, 1, main.hits.Load())
++	assert.Equal(t, 1, seen)
++	assert.Empty(t, h.LastURL())
++}
++
++func TestParseFallbackURLs(t *testing.T) {
++	urls, err := ParseFallbackURLs("https://a.example/x", []string{
++		"", " ", "https://a.example/x", "https://b.example/x", "http://c.example/x", "https://b.example/x",
++	})
++	require.NoError(t, err)
++	assert.Equal(t, []string{"https://b.example/x", "http://c.example/x"}, urls)
++
++	urls, err = ParseFallbackURLs("https://a.example/x", nil)
++	require.NoError(t, err)
++	assert.Empty(t, urls)
++
++	for _, bad := range []string{"ftp://b.example/x", "b.example/x", "https://", "file:///etc/hosts", "http://b.example/%zz"} {
++		_, err := ParseFallbackURLs("https://a.example/x", []string{bad})
++		assert.Error(t, err, bad)
++	}
++	_, err = ParseFallbackURLs("", []string{"https://b.example/x?token=secret", "ftp://c.example/x?token=secret"})
++	require.Error(t, err)
++	assert.False(t, strings.Contains(err.Error(), "secret"), err.Error())
++}
+diff --git a/docs/config.yaml b/docs/config.yaml
+index 944e570..0ad62e3 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -1834,6 +1834,8 @@ proxy-providers:
+   provider1:
+     type: http # http 的 path 可空置，默认储存路径为 homedir 的 proxies 文件夹，文件名为 url 的 md5
+     url: "url"
++    # fallback-urls: # tried in order when url does not answer (an error, a status other than 2xx/304, a broken body); each attempt has a timeout of its own, the ETag is kept per address
++    #   - "https://mirror.example.com/sub"
+     interval: 3600
+     path: ./provider1.yaml # 默认只允许存储在 mihomo 的 Home Dir，如果想存储到其他位置，请通过设置 SAFE_PATHS 环境变量指定额外的安全路径。该环境变量的语法同本操作系统的PATH环境变量解析规则（即Windows下以分号分割，其他系统下以冒号分割）
+     proxy: DIRECT
+@@ -1962,6 +1964,8 @@ rule-providers:
+     path: /path/to/save/file.yaml # 默认只允许存储在 mihomo 的 Home Dir，如果想存储到其他位置，请通过设置 SAFE_PATHS 环境变量指定额外的安全路径。该环境变量的语法同本操作系统的PATH环境变量解析规则（即Windows下以分号分割，其他系统下以冒号分割）
+     type: http # http 的 path 可空置，默认储存路径为 homedir 的 rules 文件夹，文件名为 url 的 md5
+     url: "url"
++    # fallback-urls: # tried in order when url does not answer; a 304 from url keeps the rules and asks no mirror
++    #   - "https://cdn.jsdelivr.net/gh/example/rules/file.yaml"
+     proxy: DIRECT
+     # size-limit: 10240 # 限制下载文件最大为10kb，默认为0即不限制文件大小
+   rule2:
+diff --git a/rules/provider/parse.go b/rules/provider/parse.go
+index 3ddfab8..f186081 100644
+--- a/rules/provider/parse.go
++++ b/rules/provider/parse.go
+@@ -23,6 +23,7 @@ type ruleProviderSchema struct {
+ 	Payload      []string            `provider:"payload,omitempty"`
+ 	Header       map[string][]string `provider:"header,omitempty"`
+ 	PathInBundle string              `provider:"path-in-bundle,omitempty"`
++	FallbackURLs []string            `provider:"fallback-urls,omitempty"`
+ }
+ 
+ func ParseRuleProvider(name string, mapping map[string]any, parse common.ParseRuleFunc, makeBundleFile func(pathInBundle string) resource.BundleFile) (P.RuleProvider, error) {
+@@ -56,7 +57,15 @@ func ParseRuleProvider(name string, mapping map[string]any, parse common.ParseRu
+ 				return nil, C.Path.ErrNotSafePath(path)
+ 			}
+ 		}
+-		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit)
++		fallbackURLs, err := resource.ParseFallbackURLs(schema.URL, schema.FallbackURLs)
++		if err != nil {
++			return nil, err
++		}
++		var options []resource.HTTPVehicleOption
++		if len(fallbackURLs) > 0 {
++			options = append(options, resource.WithFallbackURLs(name, fallbackURLs))
++		}
++		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit, options...)
+ 	case "inline":
+ 		return NewInlineProvider(name, behavior, schema.Payload, parse), nil
+ 	default:
+diff --git a/rules/provider/parse_test.go b/rules/provider/parse_test.go
+new file mode 100644
+index 0000000..dbb534a
+--- /dev/null
++++ b/rules/provider/parse_test.go
+@@ -0,0 +1,59 @@
++package provider
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/metacubex/mihomo/component/resource"
++	C "github.com/metacubex/mihomo/constant"
++	mihomoTunnel "github.com/metacubex/mihomo/tunnel"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func noBundle(string) resource.BundleFile { return nil }
++
++func init() { SetTunnel(mihomoTunnel.Tunnel) }
++
++// A rule-provider with fallback-urls reads its rules from the first
++// address that answers.
++func TestParseRuleProviderFallbackURLs(t *testing.T) {
++	C.SetHomeDir(t.TempDir())
++	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
++	defer main.Close()
++	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = w.Write([]byte("payload:\n  - '+.example.com'\n  - 'example.org'\n"))
++	}))
++	defer backup.Close()
++
++	p, err := ParseRuleProvider("ru-sites", map[string]any{
++		"type":          "http",
++		"behavior":      "domain",
++		"url":           main.URL + "/ru.yaml",
++		"fallback-urls": []any{"", main.URL + "/ru.yaml", backup.URL + "/ru.yaml"},
++		"path":          "./rule-sets/ru-sites.yaml",
++	}, nil, noBundle)
++	require.NoError(t, err)
++	defer p.(*RuleSetProvider).Close()
++	require.NoError(t, p.Initial())
++	assert.Equal(t, 2, p.Count())
++	body, err := p.(*RuleSetProvider).MarshalJSON()
++	require.NoError(t, err)
++	assert.Contains(t, string(body), `"lastUrl":"`+backup.URL+`/ru.yaml"`)
++}
++
++func TestParseRuleProviderBadFallbackURL(t *testing.T) {
++	C.SetHomeDir(t.TempDir())
++	for _, urls := range []any{[]any{"ftp://mirror.example/ru.mrs"}, []any{"mirror.example/ru.mrs"}, []any{map[string]any{"url": "https://mirror.example"}}} {
++		_, err := ParseRuleProvider("ru-sites", map[string]any{
++			"type":          "http",
++			"behavior":      "domain",
++			"format":        "mrs",
++			"url":           "https://example.com/ru.mrs",
++			"fallback-urls": urls,
++		}, nil, noBundle)
++		assert.Error(t, err, "%v", urls)
++	}
++}
+diff --git a/rules/provider/provider.go b/rules/provider/provider.go
+index 2e7829a..8b6808f 100644
+--- a/rules/provider/provider.go
++++ b/rules/provider/provider.go
+@@ -41,6 +41,7 @@ type providerForApi struct {
+ 	VehicleType string    `json:"vehicleType"`
+ 	UpdatedAt   time.Time `json:"updatedAt"`
+ 	Payload     []string  `json:"payload,omitempty"`
++	LastUrl     string    `json:"lastUrl,omitempty"`
+ }
+ 
+ type ruleStrategy interface {
+@@ -114,6 +115,7 @@ func (rp *ruleSetProvider) MarshalJSON() ([]byte, error) {
+ 			Type:        rp.Type().String(),
+ 			UpdatedAt:   rp.UpdatedAt(),
+ 			VehicleType: rp.VehicleType().String(),
++			LastUrl:     resource.LastURL(rp.Vehicle()),
+ 		})
+ }
+ 
