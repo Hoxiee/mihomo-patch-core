@@ -1,0 +1,82 @@
+mihomo-patch-core: reclash/0020-trusttunnel-quic
+Source: ReClash review (2026-11-25); keep TrustTunnel's bool quic option.
+
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index ddce68dc..420e1ff1 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -203,7 +203,6 @@ type BasicOption struct {
+ 	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
+ 	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
+ 	Udp443      string      `proxy:"udp-443,omitempty"`      // "allow" (default) or "reject": send UDP port 443 (QUIC) traffic into REJECT
+-	Quic        string      `proxy:"quic,omitempty"`         // alias of udp-443
+ 
+ 	// FragmentOpts splits the first TLS ClientHello of every TCP connection of
+ 	// this proxy (ClashFest core patch 0033, from Rerowros/veles); off when empty.
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 5fa5509d..91a72721 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -292,7 +292,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 
+ 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
+ 	if err := decoder.Decode(mapping, &basicOption); err == nil {
+-		udp443, err := resolveUdp443(basicOption.Udp443, basicOption.Quic)
++		udp443, err := resolveUdp443(basicOption.Udp443, quicAlias(mapping))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -309,6 +309,16 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 	return parsed, nil
+ }
+ 
++// quicAlias reads the string form of the udp-443 alias. TrustTunnel owns the
++// same key as a bool, and must not receive a string through BasicOption.
++func quicAlias(mapping map[string]any) string {
++	if mapping["type"] == "trusttunnel" {
++		return ""
++	}
++	value, _ := mapping["quic"].(string)
++	return value
++}
++
+ // resolveUdp443 merges the udp-443 option with its `quic` alias.
+ func resolveUdp443(udp443, quic string) (string, error) {
+ 	for _, v := range []string{udp443, quic} {
+diff --git a/adapter/parser_udp443_test.go b/adapter/parser_udp443_test.go
+index 742a5964..39c914ee 100644
+--- a/adapter/parser_udp443_test.go
++++ b/adapter/parser_udp443_test.go
+@@ -91,6 +91,17 @@ func TestParseProxyUdp443ExplicitAllow(t *testing.T) {
+ 	}
+ }
+ 
++// TrustTunnel has its own bool `quic` option; the udp-443 alias must not make
++// the shared BasicOption decoder reject that existing proxy type.
++func TestParseProxyTrustTunnelQuicBool(t *testing.T) {
++	if _, err := ParseProxy(map[string]any{
++		"name": "tt", "type": "trusttunnel", "server": "example.com", "port": 443,
++		"username": "u", "password": "p", "quic": true,
++	}); err != nil {
++		t.Fatalf("TrustTunnel quic bool must decode: %v", err)
++	}
++}
++
+ func TestParseProxyUdp443Invalid(t *testing.T) {
+ 	for _, mapping := range []map[string]any{
+ 		{"name": "d", "type": "direct", "udp-443": "drop"},
+diff --git a/adapter/provider/override.go b/adapter/provider/override.go
+index 3bca64a8..a68ecb52 100644
+--- a/adapter/provider/override.go
++++ b/adapter/provider/override.go
+@@ -79,7 +79,9 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
+ 		mapping["udp-443"] = *o.Udp443
+ 	}
+ 	if o.Quic != nil {
+-		mapping["quic"] = *o.Quic
++		if proxyType, _ := mapping["type"].(string); proxyType != "trusttunnel" {
++			mapping["quic"] = *o.Quic
++		}
+ 	}
+ 
+ 	for _, expr := range o.ProxyName {

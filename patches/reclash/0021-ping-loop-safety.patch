@@ -1,0 +1,134 @@
+mihomo-patch-core: reclash/0021-ping-loop-safety
+Source: ReClash review (2026-11-25); fix health-check scheduling hazards.
+
+diff --git a/adapter/provider/healthcheck.go b/adapter/provider/healthcheck.go
+index 6fa53ba1..7d25c6c7 100644
+--- a/adapter/provider/healthcheck.go
++++ b/adapter/provider/healthcheck.go
+@@ -42,6 +42,7 @@ type HealthCheck struct {
+ 	lastCheck      atomic.TypedValue[time.Time]
+ 	singleDo       *singledo.Single[struct{}]
+ 	scheduledDo    *singledo.Single[struct{}]
++	pingWG         sync.WaitGroup
+ 	timeout        time.Duration
+ 	owner          string
+ }
+@@ -85,7 +86,12 @@ func (hc *HealthCheck) process() {
+ 	ticker := time.NewTicker(hc.interval)
+ 	go hc.check()
+ 	for url, profile := range hc.profiledURLs() {
+-		go hc.pingLoop(url, profile)
++		url, profile := url, profile
++		hc.pingWG.Add(1)
++		go func() {
++			defer hc.pingWG.Done()
++			hc.pingLoop(url, profile)
++		}()
+ 	}
+ 	var deferred bool
+ 	for {
+@@ -118,10 +124,7 @@ func (hc *HealthCheck) scheduledCheck() {
+ 		hc.check()
+ 		return
+ 	}
+-	_, _, _ = hc.scheduledDo.Do(func() (struct{}, error) {
+-		hc.run(hc.scheduledDo, false)
+-		return struct{}{}, nil
+-	})
++	hc.run(hc.scheduledDo, false)
+ }
+ 
+ func (hc *HealthCheck) setProxies(proxies []C.Proxy) {
+@@ -258,6 +261,7 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
+ 
+ func (hc *HealthCheck) close() {
+ 	hc.ctxCancel()
++	hc.pingWG.Wait()
+ 	pingconfig.Release(hc)
+ }
+ 
+@@ -315,7 +319,6 @@ func (hc *HealthCheck) pingLoop(url string, profile *pingconfig.Profile) {
+ 	cycle := profile.Cycle()
+ 	sem := make(chan struct{}, maxPingChecks)
+ 	own := map[C.Proxy]time.Time{}
+-	var lastCycle time.Time
+ 	timer := time.NewTimer(cycle)
+ 	defer timer.Stop()
+ 	for {
+@@ -326,21 +329,23 @@ func (hc *HealthCheck) pingLoop(url string, profile *pingconfig.Profile) {
+ 		}
+ 		start := time.Now()
+ 		timer.Reset(cycle)
+-		if !hc.pingCycleDue(cycle, lastCycle) {
++		if !hc.pingCycleDue(cycle) {
+ 			continue
+ 		}
+-		lastCycle = start
+ 		hc.pingCycle(url, profile, rnd, sem, own, start)
+ 	}
+ }
+ 
+ // pingCycleDue says whether a cycle runs: not while a lazy group is unused,
+-// as scheduledCheck, and at the pace of the power-save mode.
+-func (hc *HealthCheck) pingCycleDue(cycle time.Duration, lastCycle time.Time) bool {
++// while the screen is off, or while the routing engine is the single prover.
++func (hc *HealthCheck) pingCycleDue(cycle time.Duration) bool {
+ 	if hc.lazy && time.Since(hc.lastTouch.Load()) >= cycle {
+ 		log.Debugln("Skip a ping-config cycle because we are lazy")
+ 		return false
+ 	}
++	if screenOff() || autoHealthCheckSuppressed(hc.owner) {
++		return false
++	}
+ 	return true
+ }
+ 
+diff --git a/adapter/provider/healthcheck_ping_test.go b/adapter/provider/healthcheck_ping_test.go
+index 638fb781..b1aef54f 100644
+--- a/adapter/provider/healthcheck_ping_test.go
++++ b/adapter/provider/healthcheck_ping_test.go
+@@ -196,13 +196,13 @@ func TestPingCycleIsLazy(t *testing.T) {
+ 	proxies, _ := pingProxies(1)
+ 	hc := NewHealthCheck(proxies, pingURL, 1000, 300, true, nil)
+ 	defer hc.close()
+-	assert.False(t, hc.pingCycleDue(time.Second, time.Time{}), "never used")
++	assert.False(t, hc.pingCycleDue(time.Second), "never used")
+ 	hc.touch()
+-	assert.True(t, hc.pingCycleDue(time.Second, time.Time{}))
++	assert.True(t, hc.pingCycleDue(time.Second))
+ 
+ 	eager := NewHealthCheck(proxies, pingURL, 1000, 300, false, nil)
+ 	defer eager.close()
+-	assert.True(t, eager.pingCycleDue(time.Second, time.Time{}))
++	assert.True(t, eager.pingCycleDue(time.Second))
+ }
+ 
+ // Scheduled ticks leave a profiled url to its loop; a check now (start,
+@@ -300,3 +300,27 @@ func TestPingCycleWarnsOfTraffic(t *testing.T) {
+ 	runCycle(hc, small, map[C.Proxy]time.Time{})
+ 	assert.False(t, small.WarnOnce(), "the cycle warned already")
+ }
++
++func TestPingCycleDueHonorsScreenAndSuppression(t *testing.T) {
++	hc := &HealthCheck{interval: time.Minute, owner: "test-provider"}
++	t.Cleanup(func() {
++		SetScreenOff(false)
++		SetAutoHealthCheckSuppressed(nil)
++	})
++
++	SetScreenOff(true)
++	if hc.pingCycleDue(time.Minute) {
++		t.Fatal("screen-off must stop ping-config cycles")
++	}
++
++	SetScreenOff(false)
++	SetAutoHealthCheckSuppressed([]string{hc.owner})
++	if hc.pingCycleDue(time.Minute) {
++		t.Fatal("a suppressed provider must stop ping-config cycles")
++	}
++
++	SetAutoHealthCheckSuppressed(nil)
++	if !hc.pingCycleDue(time.Minute) {
++		t.Fatal("an active provider must run ping-config cycles")
++	}
++}

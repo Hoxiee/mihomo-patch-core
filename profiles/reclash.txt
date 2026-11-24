@@ -19,3 +19,5 @@ reclash/0016-xhttp-h2-flow.patch
 reclash/0017-reality-password.patch
 reclash/0018-ping-config.patch
 reclash/0019-xhttp-session-bounds.patch
+reclash/0020-trusttunnel-quic.patch
+reclash/0021-ping-loop-safety.patch
