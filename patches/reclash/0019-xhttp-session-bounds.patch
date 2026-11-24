@@ -1,0 +1,88 @@
+mihomo-patch-core: reclash/0019-xhttp-session-bounds
+Source: ReClash review (2026-11-25), hardening Xray-compatible xhttp sessions.
+
+diff --git a/transport/xhttp/config.go b/transport/xhttp/config.go
+index d595af3..e938c05 100644
+--- a/transport/xhttp/config.go
++++ b/transport/xhttp/config.go
+@@ -604,13 +604,23 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
+ 	return nil
+ }
+ 
++const (
++	maxSessionLength = 4096
++	maxSessionTable  = 4096
++	sessionRoomFloor = 2 << 30
++)
++
+ func roomSize(tableSize int, min, max int) *big.Int {
+ 	base := big.NewInt(int64(tableSize))
+ 	sum := new(big.Int)
+ 	term := new(big.Int)
++	floor := big.NewInt(sessionRoomFloor)
+ 	for k := min; k <= max; k++ {
+ 		term.Exp(base, big.NewInt(int64(k)), nil)
+ 		sum.Add(sum, term)
++		if sum.Cmp(floor) >= 0 {
++			return sum
++		}
+ 	}
+ 	return sum
+ }
+@@ -644,13 +654,19 @@ func (c *Config) GetGenerateSessionID() (func() string, error) {
+ 		if predefined, ok := predefinedTable[sessionTable]; ok {
+ 			sessionTable = predefined
+ 		}
++		if len(sessionTable) > maxSessionTable {
++			return nil, errors.New("session-table is too large")
++		}
+ 		sessionLength, err := ParseRange(c.SessionLength, "16-32")
+ 		if err != nil {
+ 			return nil, fmt.Errorf("invalid session-length: %w", err)
+ 		}
++		if sessionLength.Max > maxSessionLength {
++			return nil, errors.New("session-length is too large")
++		}
+ 		room := roomSize(len(sessionTable), sessionLength.Min, sessionLength.Max)
+ 		// 2.1B possiblities should be enough
+-		if room.Cmp(big.NewInt(2<<30)) < 0 {
++		if room.Cmp(big.NewInt(sessionRoomFloor)) < 0 {
+ 			return nil, errors.New("session-table or session-length is too small")
+ 		}
+ 		if sessionLength.Min <= 0 {
+diff --git a/transport/xhttp/session_bounds_test.go b/transport/xhttp/session_bounds_test.go
+new file mode 100644
+index 0000000..7096a01
+--- /dev/null
++++ b/transport/xhttp/session_bounds_test.go
+@@ -0,0 +1,30 @@
++package xhttp
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestGetGenerateSessionIDRejectsHugeRange(t *testing.T) {
++	cfg := &Config{SessionTable: "a", SessionLength: "0-2147483647"}
++	if _, err := cfg.GetGenerateSessionID(); err == nil {
++		t.Fatal("a session-length range spanning billions of values must be rejected")
++	}
++}
++
++func TestGetGenerateSessionIDRejectsHugeTable(t *testing.T) {
++	cfg := &Config{
++		SessionTable:  strings.Repeat("a", maxSessionTable+1),
++		SessionLength: "16-32",
++	}
++	if _, err := cfg.GetGenerateSessionID(); err == nil {
++		t.Fatal("a session-table larger than the bound must be rejected")
++	}
++}
++
++func TestGetGenerateSessionIDKeepsNormalSettings(t *testing.T) {
++	cfg := &Config{SessionTable: "abcdefghijklmnopqrstuvwxyz", SessionLength: "16-32"}
++	if _, err := cfg.GetGenerateSessionID(); err != nil {
++		t.Fatalf("normal session settings must load: %v", err)
++	}
++}

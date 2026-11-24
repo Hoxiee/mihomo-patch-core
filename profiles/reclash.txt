@@ -18,3 +18,4 @@ reclash/0015-fallback-urls.patch
 reclash/0016-xhttp-h2-flow.patch
 reclash/0017-reality-password.patch
 reclash/0018-ping-config.patch
+reclash/0019-xhttp-session-bounds.patch
