@@ -24,7 +24,7 @@ kept wherever the source had them.
   references.
 - [legiz-ru/Prizrak-Core](https://github.com/legiz-ru/Prizrak-Core) — GPL-3.0. Origin of the
   finalmask implementation, the compact xdns spelling, Firefox 156/160 fingerprints, the mux.cool
-  client and XDRIVE.
+  client, XDRIVE and the modern-first REALITY hello policy.
 - [Rerowros/veles](https://github.com/Rerowros/veles) — GPL-3.0. Source of the graceful proxy
   options, Chrome 155, XHTTP packet-up work and several REALITY fixes as adapted by ClashFest.
 - [getmikan/Citrus](https://github.com/getmikan/Citrus) — GPL-3.0. Origin of the chain/REALITY

@@ -1,5 +1,5 @@
 mihomo-patch-core: xray/0047-reality-mlkem-first
-Source: Prizrak-Core REALITY hello policy (GPL-3.0); Xray 26.9.8 rejects classic ClientHello.
+Source: Prizrak-Core 2c12a686 REALITY hello policy (GPL-3.0); Xray 26.9.8 rejects classic ClientHello.
 
 diff --git a/component/tls/reality.go b/component/tls/reality.go
 index cacd4631..bf0184e0 100644

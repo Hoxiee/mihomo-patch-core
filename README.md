@@ -123,9 +123,10 @@ The former `feat: support ReClash` commit is one concern per patch:
 
 ### Xray coverage
 
-- **REALITY and TLS** — configurable global and per-proxy client version, adaptive X25519MLKEM768
-  policy with a per-server memo, ML-DSA-65 verification, Xray fingerprint names, comma-separated
-  certificate pins and name lists, ECH PEM/query forms, Chrome 155, Firefox 156/160, and Xray's
+- **REALITY and TLS** — configurable global and per-proxy client version, adaptive
+  X25519MLKEM768 policy with a per-server memo (modern-first, classic fallback), ML-DSA-65
+  verification, Xray fingerprint names, comma-separated certificate pins and name lists, ECH
+  PEM/query forms, Chrome 155, Firefox 156/160, and Xray's
   current defaults: `chrome` = Chrome 155, `firefox` = Firefox 160; `chrome133` and `firefox148`
   keep the older mihomo parrots.
 - **Share links** — `pqv` → `reality-opts.mldsa65-verify`, `vcn` → `name-cert-verify`,
