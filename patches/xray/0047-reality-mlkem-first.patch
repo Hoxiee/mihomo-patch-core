@@ -1,0 +1,28 @@
+mihomo-patch-core: xray/0047-reality-mlkem-first
+Source: Prizrak-Core REALITY hello policy (GPL-3.0); Xray 26.9.8 rejects classic ClientHello.
+
+diff --git a/component/tls/reality.go b/component/tls/reality.go
+index cacd4631..bf0184e0 100644
+--- a/component/tls/reality.go
++++ b/component/tls/reality.go
+@@ -74,11 +74,17 @@ const (
+ )
+ 
+ // RealityMLKEMFirst is the first guess in Auto mode for a server not seen yet.
+-// Classic first keeps the historical behaviour; the memo flips it after one
+-// failure against a server that insists on the hybrid key share.
++// Xray builds from 26.9.8 on reject a classic ClientHello, and current ReClash
++// defaults (Chrome 155, Firefox 160) already send the hybrid share. Starting
++// with X25519MLKEM768 avoids a failed handshake on those nodes; the memo flips
++// to classic after one failure against an older server.
+ var (
+ 	realityMLKEMPolicy atomic.Int32
+-	realityMLKEMFirst  atomic.Bool
++	realityMLKEMFirst = func() atomic.Bool {
++		var first atomic.Bool
++		first.Store(true)
++		return first
++	}()
+ )
+ 
+ func SetRealityMLKEMPolicy(policy RealityMLKEMPolicy) { realityMLKEMPolicy.Store(int32(policy)) }
