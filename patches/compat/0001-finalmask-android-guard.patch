@@ -1,0 +1,51 @@
+mihomo-patch-core: compat/0001-finalmask-android-guard
+Adapts ClashFest's finalmask xicmp guard from features.CMFA to the host layer's features.Android.
+
+diff --git a/config/finalmask_test.go b/config/finalmask_test.go
+index 742b37d..0205a74 100644
+--- a/config/finalmask_test.go
++++ b/config/finalmask_test.go
+@@ -171,7 +171,7 @@ func TestFinalMaskProfileUnusableKeepsLoading(t *testing.T) {
+           length: 1-5
+ `, "xdrive"},
+ 	}
+-	if features.CMFA {
++	if features.Android {
+ 		// On xhttp over HTTP/3, so the xicmp guard refuses it, not the network check.
+ 		unusable["xicmp"] = struct{ node, want string }{finalMaskXHTTPH3Node("xicmp", `
+         - type: xicmp
+diff --git a/transport/finalmask/xicmp/xicmp.go b/transport/finalmask/xicmp/xicmp.go
+index e7df04e..4ac4dab 100644
+--- a/transport/finalmask/xicmp/xicmp.go
++++ b/transport/finalmask/xicmp/xicmp.go
+@@ -53,7 +53,7 @@ func (c *Config) HandleDial() {}
+ var errCMFA = goerrors.New("xicmp: not supported on Android, its ICMP sockets would bypass the VPN's socket protection")
+ 
+ func (c *Config) WrapPacketConnClient(_ context.Context, _ net.PacketConn, dest *finalmask.Destination, _ *finalmask.Dialer) (net.PacketConn, error) {
+-	if features.CMFA {
++	if features.Android {
+ 		return nil, errCMFA
+ 	}
+ 	if _, ok := dest.IP(); !ok && len(c.IPs) == 0 {
+diff --git a/transport/finalmask/xicmp/xicmp_test.go b/transport/finalmask/xicmp/xicmp_test.go
+index 78a0431..429ba5c 100644
+--- a/transport/finalmask/xicmp/xicmp_test.go
++++ b/transport/finalmask/xicmp/xicmp_test.go
+@@ -64,7 +64,7 @@ func TestChecksumMatchesXNet(t *testing.T) {
+ }
+ 
+ func TestClientExchangesEchoes(t *testing.T) {
+-	if features.CMFA {
++	if features.Android {
+ 		t.Skip("xicmp is refused under cmfa")
+ 	}
+ 	s4, s6 := newFakeSocket(1), newFakeSocket(58)
+@@ -148,7 +148,7 @@ func TestRefusedUnderCMFA(t *testing.T) {
+ 	require.NoError(t, err)
+ 	dest := finalmask.Destination{Host: "example.com", Port: 443}
+ 	conn, err := cfg.WrapPacketConnClient(context.Background(), nil, &dest, nil)
+-	if !features.CMFA {
++	if !features.Android {
+ 		require.NoError(t, err)
+ 		_ = conn.Close()
+ 		return

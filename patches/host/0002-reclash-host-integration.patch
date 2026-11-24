@@ -1,0 +1,2021 @@
+mihomo-patch-core: host/0002-reclash-host-integration
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), extracted from the ReClash core fork.
+
+diff --git a/adapter/adapter.go b/adapter/adapter.go
+index 9cd4fa01..33fa0d70 100644
+--- a/adapter/adapter.go
++++ b/adapter/adapter.go
+@@ -32,12 +32,22 @@ type internalProxyState struct {
+ }
+ 
+ type Proxy struct {
++	routeFingerprint    string
++	endpointFingerprint string
++	routeDependency     string
++	desc                string
++	favorite            bool
+ 	C.ProxyAdapter
+ 	alive   atomic.Bool
+ 	history *queue.Queue[C.DelayHistory]
+ 	extra   xsync.Map[string, *internalProxyState]
+ }
+ 
++// Annotations are the description and favorite mark the node's own config carries.
++func (p *Proxy) Annotations() (desc string, favorite bool) {
++	return p.desc, p.favorite
++}
++
+ // Adapter implements C.Proxy
+ func (p *Proxy) Adapter() C.ProxyAdapter {
+ 	return p.ProxyAdapter
+@@ -54,13 +64,43 @@ func (p *Proxy) AliveForTestUrl(url string) bool {
+ 
+ // DialContext implements C.ProxyAdapter
+ func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
++	if err := checkDialPolicy(p, metadata); err != nil {
++		return nil, err
++	}
++	start := time.Now()
+ 	conn, err := p.ProxyAdapter.DialContext(ctx, metadata)
++	if err == nil {
++		if policyErr := checkDialPolicy(p, metadata); policyErr != nil {
++			if conn != nil {
++				_ = conn.Close()
++			}
++			return nil, policyErr
++		}
++	}
++	if DialResultHook != nil {
++		DialResultHook(p.Name(), metadata.SourceAddress(), err, time.Since(start))
++	}
+ 	return conn, err
+ }
+ 
+ // ListenPacketContext implements C.ProxyAdapter
+ func (p *Proxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
++	if err := checkDialPolicy(p, metadata); err != nil {
++		return nil, err
++	}
++	start := time.Now()
+ 	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata)
++	if err == nil {
++		if policyErr := checkDialPolicy(p, metadata); policyErr != nil {
++			if pc != nil {
++				_ = pc.Close()
++			}
++			return nil, policyErr
++		}
++	}
++	if DialResultHook != nil {
++		DialResultHook(p.Name(), metadata.SourceAddress(), err, time.Since(start))
++	}
+ 	return pc, err
+ }
+ 
+diff --git a/adapter/outbound/anytls.go b/adapter/outbound/anytls.go
+index 99786614..a3343f7c 100644
+--- a/adapter/outbound/anytls.go
++++ b/adapter/outbound/anytls.go
+@@ -99,6 +99,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
+ 			Addr:         addr,
+ 			Type:         C.AnyTLS,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index d6942ba0..235e1084 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -27,19 +27,20 @@ type ProxyAdapter interface {
+ }
+ 
+ type Base struct {
+-	name   string
+-	addr   string
+-	tp     C.AdapterType
+-	pdName string
+-	udp    bool
+-	xudp   bool
+-	tfo    bool
+-	mpTcp  bool
+-	iface  string
+-	rmark  int
+-	prefer C.DNSPrefer
+-	dialer C.Dialer
+-	id     uuid.UUID
++	name      string
++	addr      string
++	tp        C.AdapterType
++	pdName    string
++	diversity string
++	udp       bool
++	xudp      bool
++	tfo       bool
++	mpTcp     bool
++	iface     string
++	rmark     int
++	prefer    C.DNSPrefer
++	dialer    C.Dialer
++	id        uuid.UUID
+ }
+ 
+ type BaseOption struct {
+@@ -47,6 +48,7 @@ type BaseOption struct {
+ 	Addr         string
+ 	Type         C.AdapterType
+ 	ProviderName string
++	Diversity    string
+ 	UDP          bool
+ 	XUDP         bool
+ 	TFO          bool
+@@ -58,18 +60,19 @@ type BaseOption struct {
+ 
+ func NewBase(opt BaseOption) *Base {
+ 	return &Base{
+-		name:   opt.Name,
+-		addr:   opt.Addr,
+-		tp:     opt.Type,
+-		pdName: opt.ProviderName,
+-		udp:    opt.UDP,
+-		xudp:   opt.XUDP,
+-		tfo:    opt.TFO,
+-		mpTcp:  opt.MPTCP,
+-		iface:  opt.Interface,
+-		rmark:  opt.RoutingMark,
+-		prefer: opt.Prefer,
+-		id:     utils.NewUUIDV4(),
++		name:      opt.Name,
++		addr:      opt.Addr,
++		tp:        opt.Type,
++		pdName:    opt.ProviderName,
++		diversity: opt.Diversity,
++		udp:       opt.UDP,
++		xudp:      opt.XUDP,
++		tfo:       opt.TFO,
++		mpTcp:     opt.MPTCP,
++		iface:     opt.Interface,
++		rmark:     opt.RoutingMark,
++		prefer:    opt.Prefer,
++		id:        utils.NewUUIDV4(),
+ 	}
+ }
+ 
+@@ -116,6 +119,7 @@ func (b *Base) ProxyInfo() (info C.ProxyInfo) {
+ 	info.Interface = b.iface
+ 	info.RoutingMark = b.rmark
+ 	info.ProviderName = b.pdName
++	info.DiversityFingerprint = b.diversity
+ 	return
+ }
+ 
+@@ -204,6 +208,7 @@ type BasicOption struct {
+ 	DialerForAPI C.Dialer `proxy:"-"` // the dialer used for API usage has higher priority than all the above configurations.
+ 	TunnelForAPI C.Tunnel `proxy:"-"`
+ 	ProviderName string   `proxy:"-"`
++	Diversity    string   `proxy:"-"`
+ }
+ 
+ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
+diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
+index a204647f..9418baf6 100644
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -70,6 +70,7 @@ func NewDirectWithOption(option DirectOption) *Direct {
+ 			Name:         option.Name,
+ 			Type:         C.Direct,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/dns.go b/adapter/outbound/dns.go
+index 2a2d07eb..7ec40f88 100644
+--- a/adapter/outbound/dns.go
++++ b/adapter/outbound/dns.go
+@@ -159,6 +159,7 @@ func NewDnsWithOption(option DnsOption) *Dns {
+ 			Name:         option.Name,
+ 			Type:         C.Dns,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/easytier.go b/adapter/outbound/easytier.go
+index 23962e6f..ae39150c 100644
+--- a/adapter/outbound/easytier.go
++++ b/adapter/outbound/easytier.go
+@@ -152,6 +152,7 @@ func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
+ 			Addr:         addr,
+ 			Type:         C.EasyTier,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/external.go b/adapter/outbound/external.go
+new file mode 100644
+index 00000000..98e4f53b
+--- /dev/null
++++ b/adapter/outbound/external.go
+@@ -0,0 +1,25 @@
++package outbound
++
++import "sync"
++
++// ExternalFactory builds an adapter for a proxy type registered by the embedding application.
++type ExternalFactory func(mapping map[string]any, basic BasicOption) (ProxyAdapter, error)
++
++var (
++	externalMu        sync.RWMutex
++	externalFactories = map[string]ExternalFactory{}
++)
++
++// RegisterExternal adds a proxy type the built-in parser does not know. Built-in types always win.
++func RegisterExternal(name string, factory ExternalFactory) {
++	externalMu.Lock()
++	defer externalMu.Unlock()
++	externalFactories[name] = factory
++}
++
++func LookupExternal(name string) (ExternalFactory, bool) {
++	externalMu.RLock()
++	defer externalMu.RUnlock()
++	factory, ok := externalFactories[name]
++	return factory, ok
++}
+diff --git a/adapter/outbound/gost_relay.go b/adapter/outbound/gost_relay.go
+index b6b6674d..28f97085 100644
+--- a/adapter/outbound/gost_relay.go
++++ b/adapter/outbound/gost_relay.go
+@@ -81,6 +81,7 @@ func NewGostRelay(option GostRelayOption) (*GostRelay, error) {
+ 			Addr:         addr,
+ 			Type:         C.GostRelay,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/http.go b/adapter/outbound/http.go
+index b5972c59..6fd58fb2 100644
+--- a/adapter/outbound/http.go
++++ b/adapter/outbound/http.go
+@@ -177,6 +177,7 @@ func NewHttp(option HttpOption) (*Http, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.Http,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+ 			Interface:    option.Interface,
+diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
+index 26032953..531af2ab 100644
+--- a/adapter/outbound/hysteria.go
++++ b/adapter/outbound/hysteria.go
+@@ -247,6 +247,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
+ 			Addr:         addr,
+ 			Type:         C.Hysteria,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.FastOpen,
+ 			Interface:    option.Interface,
+diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
+index 4731611f..7e804b0a 100644
+--- a/adapter/outbound/hysteria2.go
++++ b/adapter/outbound/hysteria2.go
+@@ -134,6 +134,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 			Addr:         addr,
+ 			Type:         C.Hysteria2,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/masque.go b/adapter/outbound/masque.go
+index 64b3a5ed..2ddc6056 100644
+--- a/adapter/outbound/masque.go
++++ b/adapter/outbound/masque.go
+@@ -120,6 +120,7 @@ func NewMasque(option MasqueOption) (*Masque, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.Masque,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/mieru.go b/adapter/outbound/mieru.go
+index 9f4e82d6..6825d058 100644
+--- a/adapter/outbound/mieru.go
++++ b/adapter/outbound/mieru.go
+@@ -161,6 +161,7 @@ func NewMieru(option MieruOption) (*Mieru, error) {
+ 			Addr:         addr,
+ 			Type:         C.Mieru,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
+index 3c7b1e63..9f1ecb84 100644
+--- a/adapter/outbound/openvpn.go
++++ b/adapter/outbound/openvpn.go
+@@ -132,6 +132,7 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
+ 			Addr:         cfg.RemoteAddress(),
+ 			Type:         C.OpenVPN,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/rematch.go b/adapter/outbound/rematch.go
+index 247b6c50..cccdca41 100644
+--- a/adapter/outbound/rematch.go
++++ b/adapter/outbound/rematch.go
+@@ -48,6 +48,7 @@ func NewRematch(option RematchOption) (*Rematch, error) {
+ 			Name:         option.Name,
+ 			Type:         C.Rematch,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 		}),
+ 		targetRematchName: option.TargetRematchName,
+diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
+index 8fefe367..7abba4ba 100644
+--- a/adapter/outbound/shadowquic.go
++++ b/adapter/outbound/shadowquic.go
+@@ -163,6 +163,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
+ 			Addr:         addr,
+ 			Type:         C.ShadowQuic,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
+index 8c562a8d..08125de8 100644
+--- a/adapter/outbound/shadowsocks.go
++++ b/adapter/outbound/shadowsocks.go
+@@ -501,6 +501,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
+ 			Addr:         addr,
+ 			Type:         C.Shadowsocks,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
+index fd386a8a..374ac475 100644
+--- a/adapter/outbound/shadowsocksr.go
++++ b/adapter/outbound/shadowsocksr.go
+@@ -163,6 +163,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
+ 			Addr:         addr,
+ 			Type:         C.ShadowsocksR,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index ce5c58c0..1cc1168e 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -290,6 +290,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 			Addr:         addr,
+ 			Type:         C.Snell,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
+index 7f3f111f..56cd3ead 100644
+--- a/adapter/outbound/socks5.go
++++ b/adapter/outbound/socks5.go
+@@ -195,6 +195,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.Socks5,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/ssh.go b/adapter/outbound/ssh.go
+index 325e7239..f88b100a 100644
+--- a/adapter/outbound/ssh.go
++++ b/adapter/outbound/ssh.go
+@@ -206,6 +206,7 @@ func NewSsh(option SshOption) (*Ssh, error) {
+ 			Addr:         addr,
+ 			Type:         C.Ssh,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          false,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
+index 2b8a92be..dac7fabb 100644
+--- a/adapter/outbound/sudoku.go
++++ b/adapter/outbound/sudoku.go
+@@ -233,6 +233,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
+ 			Addr:         baseConf.ServerAddress,
+ 			Type:         C.Sudoku,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/tailscale.go b/adapter/outbound/tailscale.go
+index 2d487da5..2b9871a0 100644
+--- a/adapter/outbound/tailscale.go
++++ b/adapter/outbound/tailscale.go
+@@ -134,6 +134,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
+ 			Addr:         addr,
+ 			Type:         C.Tailscale,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
+index d581e80a..23a43a10 100644
+--- a/adapter/outbound/trojan.go
++++ b/adapter/outbound/trojan.go
+@@ -293,6 +293,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+ 			Addr:         addr,
+ 			Type:         C.Trojan,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/trusttunnel.go b/adapter/outbound/trusttunnel.go
+index 81f784da..f9292d2c 100644
+--- a/adapter/outbound/trusttunnel.go
++++ b/adapter/outbound/trusttunnel.go
+@@ -92,6 +92,7 @@ func NewTrustTunnel(option TrustTunnelOption) (*TrustTunnel, error) {
+ 			Addr:         addr,
+ 			Type:         C.TrustTunnel,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			TFO:          option.TFO,
+ 			MPTCP:        option.MPTCP,
+diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
+index ed54d99f..d2a8ab08 100644
+--- a/adapter/outbound/tuic.go
++++ b/adapter/outbound/tuic.go
+@@ -244,6 +244,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
+ 			Addr:         addr,
+ 			Type:         C.Tuic,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          true,
+ 			TFO:          option.FastOpen,
+ 			Interface:    option.Interface,
+diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
+index 1e5b168f..547f3c96 100644
+--- a/adapter/outbound/vless.go
++++ b/adapter/outbound/vless.go
+@@ -495,6 +495,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.Vless,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			XUDP:         option.XUDP,
+ 			TFO:          option.TFO,
+diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
+index 04a53af1..0b08b7c5 100644
+--- a/adapter/outbound/vmess.go
++++ b/adapter/outbound/vmess.go
+@@ -503,6 +503,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.Vmess,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			XUDP:         option.XUDP,
+ 			TFO:          option.TFO,
+diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
+index 54a671e8..329b3c2b 100644
+--- a/adapter/outbound/wireguard.go
++++ b/adapter/outbound/wireguard.go
+@@ -358,6 +358,7 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
+ 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+ 			Type:         C.WireGuard,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/outbound/zerotier.go b/adapter/outbound/zerotier.go
+index deca249b..d446a2e5 100644
+--- a/adapter/outbound/zerotier.go
++++ b/adapter/outbound/zerotier.go
+@@ -300,6 +300,7 @@ func NewZeroTier(option ZeroTierOption) (*ZeroTier, error) {
+ 			Addr:         option.Network,
+ 			Type:         C.ZeroTier,
+ 			ProviderName: option.ProviderName,
++			Diversity:    option.Diversity,
+ 			UDP:          option.UDP,
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 68bccdbf..8622e707 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -1,7 +1,10 @@
+ package adapter
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/metacubex/mihomo/adapter/outbound"
+ 	"github.com/metacubex/mihomo/common/structure"
+@@ -20,6 +23,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 		DialerForAPI: opt.DialerForAPI,
+ 		TunnelForAPI: opt.TunnelForAPI,
+ 		ProviderName: opt.ProviderName,
++		Diversity:    proxyDiversityFingerprint(proxyType, mapping),
+ 	}
+ 
+ 	var (
+@@ -224,7 +228,11 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 		}
+ 		proxy, err = outbound.NewEasyTier(*easyTierOption)
+ 	default:
+-		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
++		factory, ok := outbound.LookupExternal(proxyType)
++		if !ok {
++			return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
++		}
++		proxy, err = factory(mapping, basicOption)
+ 	}
+ 
+ 	if err != nil {
+@@ -246,7 +254,65 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 	}
+ 
+ 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
+-	return NewProxy(proxy), nil
++	parsed := NewProxy(proxy)
++	parsed.routeFingerprint = proxyRouteFingerprint(mapping)
++	parsed.endpointFingerprint = proxyEndpointFingerprint(mapping)
++	parsed.routeDependency = firstString(mapping, "dialer-proxy")
++	parsed.desc = firstString(mapping, descriptionKeys...)
++	parsed.favorite = isTrue(mapping["favorite"])
++	return parsed, nil
++}
++
++// The camelCase and kebab spellings are what other clients' subscriptions already carry.
++var descriptionKeys = []string{"desc", "description", "serverDescription", "server-description"}
++
++func isTrue(value any) bool {
++	switch v := value.(type) {
++	case bool:
++		return v
++	case string:
++		return strings.EqualFold(strings.TrimSpace(v), "true")
++	}
++	return false
++}
++
++func proxyDiversityFingerprint(proxyType string, mapping map[string]any) string {
++	network := firstString(mapping, "network", "transport")
++	if network == "" {
++		network = "default"
++	}
++	tls := mapping["tls"] == true
++	_, reality := mapping["reality-opts"]
++	_, obfs := mapping["obfs"]
++	if _, ok := mapping["obfs-opts"]; ok {
++		obfs = true
++	}
++	if plugin := firstString(mapping, "plugin"); plugin != "" {
++		obfs = true
++	}
++	sni := firstString(mapping, "servername", "server-name", "sni")
++	if sni == "" {
++		for _, key := range []string{"reality-opts", "tls"} {
++			if nested, ok := mapping[key].(map[string]any); ok {
++				sni = firstString(nested, "server-name", "servername", "sni")
++			}
++		}
++	}
++	sniClass := "none"
++	if sni != "" {
++		sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(sni))))
++		sniClass = hex.EncodeToString(sum[:4])
++	}
++	return fmt.Sprintf("v1|%s|%s|t=%t|r=%t|o=%t|s=%s", proxyType, strings.ToLower(network), tls, reality, obfs, sniClass)
++}
++
++func firstString(mapping map[string]any, keys ...string) string {
++	for _, key := range keys {
++		if value, ok := mapping[key].(string); ok && strings.TrimSpace(value) != "" {
++			return strings.TrimSpace(value)
++		}
++	}
++	return ""
+ }
+ 
+ type proxyOption struct {
+diff --git a/adapter/parser_easytier_reclash_test.go b/adapter/parser_easytier_reclash_test.go
+new file mode 100644
+index 00000000..28d215ae
+--- /dev/null
++++ b/adapter/parser_easytier_reclash_test.go
+@@ -0,0 +1,28 @@
++//go:build !no_easytier
++
++package adapter
++
++import "testing"
++
++func TestEasyTierPreservesDiversityFingerprint(t *testing.T) {
++	mapping := map[string]any{
++		"name":         "easytier-diversity-test",
++		"type":         "easytier",
++		"network-name": "test-network",
++		"peers":        []string{"tcp://127.0.0.1:11010"},
++	}
++	proxy, err := ParseProxy(mapping)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		if err := proxy.Close(); err != nil {
++			t.Error(err)
++		}
++	})
++
++	want := proxyDiversityFingerprint("easytier", mapping)
++	if got := proxy.ProxyInfo().DiversityFingerprint; got != want {
++		t.Fatalf("diversity fingerprint = %q, want %q", got, want)
++	}
++}
+diff --git a/adapter/parser_reclash_test.go b/adapter/parser_reclash_test.go
+new file mode 100644
+index 00000000..4b52a48d
+--- /dev/null
++++ b/adapter/parser_reclash_test.go
+@@ -0,0 +1,42 @@
++package adapter
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestProxyDiversityFingerprintSeparatesTransportAndHidesSNI(t *testing.T) {
++	base := map[string]any{
++		"network":    "ws",
++		"tls":        true,
++		"servername": "secret.example",
++	}
++	first := proxyDiversityFingerprint("vless", base)
++	second := proxyDiversityFingerprint("vless", map[string]any{
++		"network":    "grpc",
++		"tls":        true,
++		"servername": "secret.example",
++	})
++
++	if first == second {
++		t.Fatal("different transports produced one diversity fingerprint")
++	}
++	if strings.Contains(first, "secret.example") {
++		t.Fatal("diversity fingerprint exposed the raw SNI")
++	}
++	if first != proxyDiversityFingerprint("vless", base) {
++		t.Fatal("diversity fingerprint is not deterministic")
++	}
++}
++
++func TestProxyDiversityFingerprintTracksRealityAndObfs(t *testing.T) {
++	plain := proxyDiversityFingerprint("vless", map[string]any{})
++	disguised := proxyDiversityFingerprint("vless", map[string]any{
++		"reality-opts": map[string]any{"server-name": "example.com"},
++		"obfs":         "salamander",
++	})
++
++	if plain == disguised {
++		t.Fatal("reality and obfs did not affect diversity")
++	}
++}
+diff --git a/adapter/patch.go b/adapter/patch.go
+index f946f31a..1f1fb7c6 100644
+--- a/adapter/patch.go
++++ b/adapter/patch.go
+@@ -1,7 +1,42 @@
+ package adapter
+ 
++import (
++	"context"
++	"time"
++
++	"github.com/metacubex/mihomo/common/utils"
++	C "github.com/metacubex/mihomo/constant"
++)
++
+ // timedOut follows hub/route's getProxyDelay, which answers 504 rather than 503
+ // once the test's context is done.
+ type UrlTestCheck func(url string, name string, delay uint16, timedOut bool)
+ 
+ var UrlTestHook UrlTestCheck
++
++type DialResultCheck func(name string, source string, err error, elapsed time.Duration)
++
++var DialResultHook DialResultCheck
++
++var DialPolicyHook func(proxy *Proxy, metadata *C.Metadata) error
++
++func checkDialPolicy(proxy *Proxy, metadata *C.Metadata) error {
++	if DialPolicyHook != nil {
++		return DialPolicyHook(proxy, metadata)
++	}
++	return nil
++}
++
++// URLTest returns err == nil for any completed exchange and keeps the
++// expected-status verdict in its per-url state, so read that back instead.
++func (p *Proxy) URLTestStatus(
++	ctx context.Context,
++	url string,
++	expectedStatus utils.IntRanges[uint16],
++) (delay uint16, satisfied bool, err error) {
++	delay, err = p.URLTest(ctx, url, expectedStatus)
++	if err != nil {
++		return delay, false, err
++	}
++	return delay, p.AliveForTestUrl(url), nil
++}
+diff --git a/adapter/provider/healthcheck.go b/adapter/provider/healthcheck.go
+index 822a00d5..0ec7157f 100644
+--- a/adapter/provider/healthcheck.go
++++ b/adapter/provider/healthcheck.go
+@@ -39,21 +39,59 @@ type HealthCheck struct {
+ 	lastTouch      atomic.TypedValue[time.Time]
+ 	singleDo       *singledo.Single[struct{}]
+ 	timeout        time.Duration
++	owner          string
++}
++
++type hcTickAction int
++
++const (
++	hcRun hcTickAction = iota
++	hcDefer
++	hcSkip
++)
++
++// The routing engine, when it drives selection, is the single prover, so its
++// auto check is suppressed to avoid probing every node twice. Screen state wins
++// over recency next: a pocketed phone keeps touching groups from background
++// traffic, so `since < interval` alone fans out URLTests to every node while the
++// screen is off - the tunnel's main idle radio wake-up.
++func hcTickDecision(suppressed, screenOff bool, sinceTouch, interval time.Duration, lazy bool) hcTickAction {
++	switch {
++	case suppressed:
++		return hcDefer
++	case screenOff:
++		return hcDefer
++	case sinceTouch < interval:
++		return hcRun
++	case lazy:
++		return hcSkip
++	default:
++		return hcRun
++	}
+ }
+ 
+ func (hc *HealthCheck) process() {
+ 	ticker := time.NewTicker(hc.interval)
+ 	go hc.check()
++	var deferred bool
+ 	for {
+ 		select {
+ 		case <-ticker.C:
+-			lastTouch := hc.lastTouch.Load()
+-			since := time.Since(lastTouch)
+-			if !hc.lazy || since < hc.interval {
+-				hc.check()
+-			} else {
++			switch hcTickDecision(autoHealthCheckSuppressed(hc.owner), screenOff(), time.Since(hc.lastTouch.Load()), hc.interval, hc.lazy) {
++			case hcDefer:
++				deferred = true
++				log.Debugln("Defer health check until the screen comes back")
++			case hcSkip:
+ 				log.Debugln("Skip once health check because we are lazy")
++			default:
++				hc.check()
++			}
++		case <-screenWake():
++			if !deferred {
++				continue
+ 			}
++			deferred = false
++			hc.check()
+ 		case <-hc.ctx.Done():
+ 			ticker.Stop()
+ 			return
+diff --git a/adapter/provider/healthcheck_screen_test.go b/adapter/provider/healthcheck_screen_test.go
+new file mode 100644
+index 00000000..23e84830
+--- /dev/null
++++ b/adapter/provider/healthcheck_screen_test.go
+@@ -0,0 +1,55 @@
++package provider
++
++import (
++	"testing"
++	"time"
++)
++
++func TestHCTickDecision(t *testing.T) {
++	const interval = 5 * time.Minute
++	cases := []struct {
++		name       string
++		suppressed bool
++		screenOff  bool
++		sinceTouch time.Duration
++		lazy       bool
++		want       hcTickAction
++	}{
++		{"routing engine as sole prover defers the auto check", true, false, time.Second, false, hcDefer},
++		{"suppressed wins even with the screen on", true, false, time.Second, true, hcDefer},
++		{"screen off defers even when recently touched", false, true, time.Second, false, hcDefer},
++		{"screen off defers a lazy idle group", false, true, 10 * time.Minute, true, hcDefer},
++		{"screen on, recently touched, runs", false, false, time.Second, false, hcRun},
++		{"screen on, recently touched, runs even if lazy", false, false, time.Second, true, hcRun},
++		{"screen on, idle and lazy, skips", false, false, 10 * time.Minute, true, hcSkip},
++		{"screen on, idle and eager, runs", false, false, 10 * time.Minute, false, hcRun},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := hcTickDecision(c.suppressed, c.screenOff, c.sinceTouch, interval, c.lazy); got != c.want {
++				t.Fatalf("got %d, want %d", got, c.want)
++			}
++		})
++	}
++}
++
++func TestAutoHealthCheckSuppressionIsPerProvider(t *testing.T) {
++	t.Cleanup(func() { SetAutoHealthCheckSuppressed(nil) })
++	SetAutoHealthCheckSuppressed([]string{"smart"})
++	if !autoHealthCheckSuppressed("smart") || autoHealthCheckSuppressed("other") {
++		t.Fatal("suppression leaked across providers")
++	}
++	wake := screenWake()
++	SetAutoHealthCheckSuppressed([]string{"smart", "more"})
++	select {
++	case <-wake:
++		t.Fatal("adding a provider flushed deferred checks")
++	default:
++	}
++	SetAutoHealthCheckSuppressed([]string{"more"})
++	select {
++	case <-wake:
++	default:
++		t.Fatal("a released provider kept its deferred check waiting")
++	}
++}
+diff --git a/adapter/provider/patch.go b/adapter/provider/patch.go
+index 1f3306a6..bd680b2f 100644
+--- a/adapter/provider/patch.go
++++ b/adapter/provider/patch.go
+@@ -1,5 +1,76 @@
+ package provider
+ 
++import "sync"
++
+ func (pp *proxySetProvider) GetSubscriptionInfo() *SubscriptionInfo {
+ 	return pp.subscriptionInfo
+ }
++
++var (
++	screenMu     sync.Mutex
++	screenIsOff  bool
++	hcSuppressed map[string]struct{}
++	screenWakeCh = make(chan struct{})
++)
++
++// Periodic probes are the tunnel's main idle-time radio wake-up, and a group
++// nothing routed through while the screen was off has no reason to be probed.
++// The tick is deferred rather than dropped: it runs when the screen comes back,
++// so the delays a user sees are never the ones measured in their pocket.
++func SetScreenOff(off bool) {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	if screenIsOff == off {
++		return
++	}
++	screenIsOff = off
++	if off {
++		return
++	}
++	close(screenWakeCh)
++	screenWakeCh = make(chan struct{})
++}
++
++func screenOff() bool {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	return screenIsOff
++}
++
++// SetAutoHealthCheckSuppressed pauses the auto health check of the named
++// providers while the routing engine is their single prover, so their nodes are
++// not probed twice; other providers keep checking and the engine harvests their
++// results. A provider leaving the set flushes its deferred tick at once.
++func SetAutoHealthCheckSuppressed(providers []string) {
++	next := make(map[string]struct{}, len(providers))
++	for _, name := range providers {
++		next[name] = struct{}{}
++	}
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	released := false
++	for name := range hcSuppressed {
++		if _, kept := next[name]; !kept {
++			released = true
++		}
++	}
++	hcSuppressed = next
++	if !released {
++		return
++	}
++	close(screenWakeCh)
++	screenWakeCh = make(chan struct{})
++}
++
++func autoHealthCheckSuppressed(provider string) bool {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	_, suppressed := hcSuppressed[provider]
++	return suppressed
++}
++
++func screenWake() <-chan struct{} {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	return screenWakeCh
++}
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+index fa7d56bc..95d952e6 100644
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -182,6 +182,7 @@ func (pp *proxySetProvider) Close() error {
+ }
+ 
+ func NewProxySetProvider(name string, interval time.Duration, payload []map[string]any, parser resource.Parser[[]C.Proxy], vehicle P.Vehicle, hc *HealthCheck) (*ProxySetProvider, error) {
++	hc.owner = name
+ 	pd := &proxySetProvider{
+ 		baseProvider: baseProvider{
+ 			name:        name,
+@@ -259,6 +260,7 @@ func (ip *inlineProvider) Update() error {
+ }
+ 
+ func NewInlineProvider(name string, payload []map[string]any, parser resource.Parser[[]C.Proxy], hc *HealthCheck) (*InlineProvider, error) {
++	hc.owner = name
+ 	ps := ProxySchema{Proxies: payload}
+ 	buf, err := yaml.Marshal(ps)
+ 	if err != nil {
+@@ -318,6 +320,7 @@ func (cp *compatibleProvider) VehicleType() P.VehicleType {
+ }
+ 
+ func NewCompatibleProvider(name string, proxies []C.Proxy, hc *HealthCheck) (*CompatibleProvider, error) {
++	hc.owner = name
+ 	if len(proxies) == 0 {
+ 		return nil, errors.New("provider need one proxy at least")
+ 	}
+diff --git a/adapter/route_identity.go b/adapter/route_identity.go
+new file mode 100644
+index 00000000..670fde1b
+--- /dev/null
++++ b/adapter/route_identity.go
+@@ -0,0 +1,57 @@
++package adapter
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++)
++
++func (p *Proxy) RouteFingerprint() string    { return p.routeFingerprint }
++func (p *Proxy) EndpointFingerprint() string { return p.endpointFingerprint }
++func (p *Proxy) RouteDependency() string     { return p.routeDependency }
++
++func RouteFingerprintOf(mapping map[string]any) string { return proxyRouteFingerprint(mapping) }
++
++func proxyRouteFingerprint(mapping map[string]any) string {
++	route := make(map[string]any, len(mapping))
++	for key, value := range mapping {
++		if key != "name" && key != "reclash-id" {
++			route[key] = value
++		}
++	}
++	data, err := json.Marshal(route)
++	if err != nil {
++		return ""
++	}
++	sum := sha256.Sum256(data)
++	return "route-v1:" + hex.EncodeToString(sum[:])
++}
++
++// Providers rotate credentials (uuid, short-id, password) without moving the
++// server, so the endpoint alone lets the routing engine keep a node's history
++// across such a refresh.
++func proxyEndpointFingerprint(mapping map[string]any) string {
++	endpoint := map[string]any{
++		"type":   mapping["type"],
++		"server": mapping["server"],
++		"port":   mapping["port"],
++		"sni":    firstString(mapping, "servername", "sni", "peer"),
++	}
++	if host := firstString(mapping, "host"); host != "" {
++		endpoint["host"] = host
++	}
++	for _, key := range []string{"ws-opts", "http-opts", "h2-opts", "grpc-opts", "xhttp-opts"} {
++		if opts, ok := mapping[key].(map[string]any); ok {
++			endpoint[key+".path"] = firstString(opts, "path", "grpc-service-name")
++			if headers, ok := opts["headers"].(map[string]any); ok {
++				endpoint[key+".host"] = firstString(headers, "Host", "host")
++			}
++		}
++	}
++	data, err := json.Marshal(endpoint)
++	if err != nil {
++		return ""
++	}
++	sum := sha256.Sum256(data)
++	return "endpoint-v1:" + hex.EncodeToString(sum[:])
++}
+diff --git a/adapter/route_identity_test.go b/adapter/route_identity_test.go
+new file mode 100644
+index 00000000..6e3f6457
+--- /dev/null
++++ b/adapter/route_identity_test.go
+@@ -0,0 +1,75 @@
++package adapter
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestRouteFingerprintSeparatesAuthenticationAndPreservesAliases(t *testing.T) {
++	a := map[string]any{"name": "first", "type": "vless", "server": "example.com", "port": 443, "uuid": "artificial-secret", "tls": true, "reality-opts": map[string]any{"public-key": "key"}}
++	original, _ := json.Marshal(a)
++	first := proxyRouteFingerprint(a)
++	a["name"] = "alias"
++	if got := proxyRouteFingerprint(a); got != first {
++		t.Fatal("name changed route identity")
++	}
++	a["uuid"] = "other-secret"
++	if got := proxyRouteFingerprint(a); got == first {
++		t.Fatal("credentials pooled")
++	}
++	a["uuid"] = "artificial-secret"
++	a["name"] = "first"
++	after, _ := json.Marshal(a)
++	if string(after) != string(original) {
++		t.Fatal("fingerprinting changed input")
++	}
++	a["new-unknown-option"] = true
++	if proxyRouteFingerprint(a) == first {
++		t.Fatal("unknown connection option ignored")
++	}
++	a["invalid"] = make(chan int)
++	if proxyRouteFingerprint(a) != "" {
++		t.Fatal("unrepresentable route must stay unknown")
++	}
++}
++
++func TestRouteMetadataStaysPrivate(t *testing.T) {
++	p, err := ParseProxy(map[string]any{"type": "socks5", "name": "alias", "server": "example.com", "port": 1080, "username": "user", "password": "artificial-secret"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	proxy := p.(*Proxy)
++	if proxy.RouteFingerprint() == "" {
++		t.Fatal("missing fingerprint")
++	}
++	data, err := json.Marshal(proxy)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, private := range []string{proxy.RouteFingerprint(), "artificial-secret", "routeFingerprint"} {
++		if strings.Contains(string(data), private) {
++			t.Fatalf("private route data exposed: %s", private)
++		}
++	}
++}
++
++func TestEndpointFingerprintSurvivesCredentialRotation(t *testing.T) {
++	a := map[string]any{"name": "first", "type": "vless", "server": "example.com", "port": 443, "uuid": "one", "servername": "cdn.example.com", "reality-opts": map[string]any{"short-id": "aa"}}
++	first := proxyEndpointFingerprint(a)
++	a["uuid"] = "two"
++	a["reality-opts"] = map[string]any{"short-id": "bb"}
++	a["name"] = "renamed"
++	if proxyEndpointFingerprint(a) != first {
++		t.Fatal("credential rotation changed the endpoint")
++	}
++	a["servername"] = "other.example.com"
++	if proxyEndpointFingerprint(a) == first {
++		t.Fatal("SNI change kept the endpoint")
++	}
++	a["servername"] = "cdn.example.com"
++	a["port"] = 8443
++	if proxyEndpointFingerprint(a) == first {
++		t.Fatal("port change kept the endpoint")
++	}
++}
+diff --git a/component/process/process.go b/component/process/process.go
+index 8b758b91..f3914555 100644
+--- a/component/process/process.go
++++ b/component/process/process.go
+@@ -25,7 +25,7 @@ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, str
+ type PackageNameResolver func(metadata *C.Metadata) (string, error)
+ 
+ // DefaultPackageNameResolver
+-// never change type traits because it's used in CFMA
++// never change type traits because it's used in CMFA
+ var DefaultPackageNameResolver PackageNameResolver
+ 
+ func FindPackageName(metadata *C.Metadata) (string, error) {
+diff --git a/component/updater/patch.go b/component/updater/patch.go
+index 02096ab4..a6853cac 100644
+--- a/component/updater/patch.go
++++ b/component/updater/patch.go
+@@ -2,9 +2,18 @@ package updater
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"io"
++	"os"
++	"strings"
+ 	"sync"
++	"time"
+ 
++	mihomoHttp "github.com/metacubex/mihomo/component/http"
+ 	"github.com/metacubex/mihomo/log"
++
++	"github.com/metacubex/http"
+ )
+ 
+ var (
+@@ -17,6 +26,77 @@ func sendGeoUpdateStatus(geoType string, updating bool, skipped bool, updateErr
+ 	}
+ }
+ 
++// meta-rules-dat publishes a digest next to every database; a match means the
++// multi-megabyte body would be byte-identical, so it is never fetched.
++var geoDigestSuffixes = []string{".sha256sum", ".sha256"}
++
++const (
++	geoDigestTimeout = time.Second * 15
++	geoDigestLimit   = 1 << 12
++)
++
++// A skipped download still refreshes mtime, which is what schedules the next run.
++func skipGeoDownload(url string, path string) bool {
++	local, err := os.ReadFile(path)
++	if err != nil || len(local) == 0 {
++		return false
++	}
++	remote, ok := fetchGeoDigest(url)
++	if !ok || remote != hex.EncodeToString(sha256Sum(local)) {
++		return false
++	}
++	now := time.Now()
++	_ = os.Chtimes(path, now, now)
++	log.Infoln("[GEO] %s matches the published digest, download skipped", path)
++	return true
++}
++
++func sha256Sum(data []byte) []byte {
++	sum := sha256.Sum256(data)
++	return sum[:]
++}
++
++func fetchGeoDigest(url string) (string, bool) {
++	for _, suffix := range geoDigestSuffixes {
++		digest, ok := requestGeoDigest(url + suffix)
++		if ok {
++			return digest, true
++		}
++	}
++	return "", false
++}
++
++func requestGeoDigest(url string) (string, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), geoDigestTimeout)
++	defer cancel()
++
++	resp, err := mihomoHttp.HttpRequest(ctx, url, http.MethodGet, nil, nil)
++	if err != nil {
++		return "", false
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		return "", false
++	}
++	body, err := io.ReadAll(io.LimitReader(resp.Body, geoDigestLimit))
++	if err != nil {
++		return "", false
++	}
++	fields := strings.Fields(string(body))
++	if len(fields) == 0 {
++		return "", false
++	}
++	digest := strings.ToLower(fields[0])
++	if len(digest) != sha256.Size*2 {
++		return "", false
++	}
++	if _, err := hex.DecodeString(digest); err != nil {
++		return "", false
++	}
++	return digest, true
++}
++
+ var (
+ 	geoUpdateMutex  sync.Mutex
+ 	geoUpdateCancel context.CancelFunc
+diff --git a/component/updater/update_geo.go b/component/updater/update_geo.go
+index 22983385..1a0b769d 100644
+--- a/component/updater/update_geo.go
++++ b/component/updater/update_geo.go
+@@ -49,6 +49,11 @@ func UpdateMMDB() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("MMDB", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.MmdbUrl(), C.Path.MMDB()) {
++		skipped = true
++		return nil
++	}
++
+ 	vehicle := resource.NewHTTPVehicle(geodata.MmdbUrl(), C.Path.MMDB(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -86,6 +91,11 @@ func UpdateASN() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("ASN", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.ASNUrl(), C.Path.ASN()) {
++		skipped = true
++		return nil
++	}
++
+ 	vehicle := resource.NewHTTPVehicle(geodata.ASNUrl(), C.Path.ASN(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -123,6 +133,11 @@ func UpdateGeoIp() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("GEOIP", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.GeoIpUrl(), C.Path.GeoIP()) {
++		skipped = true
++		return nil
++	}
++
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+ 
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoIpUrl(), C.Path.GeoIP(), "", nil, defaultHttpTimeout, 0)
+@@ -159,6 +174,11 @@ func UpdateGeoSite() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("GEOSITE", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.GeoSiteUrl(), C.Path.GeoSite()) {
++		skipped = true
++		return nil
++	}
++
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+ 
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoSiteUrl(), C.Path.GeoSite(), "", nil, defaultHttpTimeout, 0)
+diff --git a/constant/adapters.go b/constant/adapters.go
+index ffb1f2a7..3dd2ec19 100644
+--- a/constant/adapters.go
++++ b/constant/adapters.go
+@@ -55,6 +55,7 @@ const (
+ 	ZeroTier
+ 	EasyTier
+ 	GostRelay
++	Extension
+ )
+ 
+ const (
+@@ -114,14 +115,15 @@ type Dialer interface {
+ }
+ 
+ type ProxyInfo struct {
+-	XUDP         bool
+-	TFO          bool
+-	MPTCP        bool
+-	SMUX         bool
+-	Interface    string
+-	RoutingMark  int
+-	ProviderName string
+-	DialerProxy  string
++	XUDP                 bool
++	TFO                  bool
++	MPTCP                bool
++	SMUX                 bool
++	Interface            string
++	RoutingMark          int
++	ProviderName         string
++	DiversityFingerprint string
++	DialerProxy          string
+ }
+ 
+ type ProxyAdapter interface {
+@@ -243,6 +245,8 @@ func (at AdapterType) String() string {
+ 		return "EasyTier"
+ 	case GostRelay:
+ 		return "GostRelay"
++	case Extension:
++		return "Extension"
+ 	case Relay:
+ 		return "Relay"
+ 	case Selector:
+diff --git a/constant/metadata.go b/constant/metadata.go
+index 76d1e0e5..0eedc50a 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -188,6 +188,9 @@ func (t Type) MarshalJSON() ([]byte, error) {
+ 
+ // Metadata is used to store connection address
+ type Metadata struct {
++	PolicyGeneration uint64 `json:"-"`
++	PolicyGlobal     bool   `json:"-"`
++
+ 	NetWork      NetWork    `json:"network"`
+ 	Type         Type       `json:"type"`
+ 	SrcIP        netip.Addr `json:"sourceIP"`
+diff --git a/hub/route/server.go b/hub/route/server.go
+index b1659cd0..6d37d480 100644
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -181,7 +181,9 @@ func start(cfg *Config) {
+ 			Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors),
+ 		}
+ 		httpServer = server
+-		_ = server.Serve(l)
++		if err = server.Serve(l); err != nil {
++			log.Errorln("External controller serve error: %s", err)
++		}
+ 	}
+ }
+ 
+diff --git a/listener/patch.go b/listener/patch.go
+index 6ab5aa11..f500ea3f 100644
+--- a/listener/patch.go
++++ b/listener/patch.go
+@@ -57,11 +57,6 @@ func StopListener() {
+ 		shadowSocksListener = nil
+ 	}
+ 
+-	if shadowSocksListener != nil {
+-		_ = shadowSocksListener.Close()
+-		shadowSocksListener = nil
+-	}
+-
+ 	if vmessListener != nil {
+ 		_ = vmessListener.Close()
+ 		vmessListener = nil
+diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
+index 3373a464..9b5d5c47 100644
+--- a/listener/sing_tun/server.go
++++ b/listener/sing_tun/server.go
+@@ -38,6 +38,7 @@ import (
+ 
+ var InterfaceName = "Meta"
+ var EnforceBindInterface = false
++var NewStack = tun.NewStack
+ 
+ type Listener struct {
+ 	closed  bool
+@@ -503,7 +504,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
+ 	}
+ 	l.tunIf = tunIf
+ 
+-	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
++	tunStack, err := NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+ 	if err != nil {
+ 		return
+ 	}
+diff --git a/tunnel/evidence.go b/tunnel/evidence.go
+new file mode 100644
+index 00000000..6eec5ff3
+--- /dev/null
++++ b/tunnel/evidence.go
+@@ -0,0 +1,107 @@
++package tunnel
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"syscall"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type FlowEvidenceStage string
++
++const (
++	FlowEvidenceIngress         FlowEvidenceStage = "ingress"
++	FlowEvidencePreHandleFailed FlowEvidenceStage = "preHandleFailed"
++	FlowEvidenceRouteResolved   FlowEvidenceStage = "routeResolved"
++	FlowEvidenceRouteFailed     FlowEvidenceStage = "routeFailed"
++	FlowEvidenceDialStarted     FlowEvidenceStage = "dialStarted"
++	FlowEvidenceDialFinished    FlowEvidenceStage = "dialFinished"
++)
++
++type FlowEvidence struct {
++	Stage       FlowEvidenceStage
++	At          time.Time
++	Network     C.NetWork
++	InboundType C.Type
++	InboundName string
++	SourceIP    netip.Addr
++	SourcePort  uint16
++	TargetIP    netip.Addr
++	TargetPort  uint16
++	TargetHost  string
++	UID         uint32
++	RuleType    string
++	Outbound    string
++	ErrorClass  string
++	Duration    time.Duration
++}
++
++type FlowEvidenceNotify func(event FlowEvidence)
++
++var DefaultFlowEvidenceNotify FlowEvidenceNotify
++
++func notifyFlowEvidence(stage FlowEvidenceStage, metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error, duration time.Duration) {
++	notify := DefaultFlowEvidenceNotify
++	if notify == nil || metadata == nil {
++		return
++	}
++	event := FlowEvidence{
++		Stage:       stage,
++		At:          time.Now(),
++		Network:     metadata.NetWork,
++		InboundType: metadata.Type,
++		InboundName: metadata.InName,
++		SourceIP:    metadata.SrcIP,
++		SourcePort:  metadata.SrcPort,
++		TargetIP:    metadata.DstIP,
++		TargetPort:  metadata.DstPort,
++		TargetHost:  metadata.Host,
++		UID:         metadata.Uid,
++		ErrorClass:  flowErrorClass(err),
++		Duration:    duration,
++	}
++	if rule != nil {
++		event.RuleType = rule.RuleType().String()
++	}
++	if proxy != nil {
++		// The subscription reporter keys per-node stats on this name and matches
++		// it against leaf-proxy labels, so record the dialed leaf, not the group.
++		leaf := proxy
++		for inner := leaf.Unwrap(metadata, false); inner != nil; inner = leaf.Unwrap(metadata, false) {
++			leaf = inner
++		}
++		event.Outbound = leaf.Name()
++	}
++	notify(event)
++}
++
++func flowErrorClass(err error) string {
++	if err == nil {
++		return ""
++	}
++	switch {
++	case errors.Is(err, context.Canceled):
++		return "cancelled"
++	case errors.Is(err, context.DeadlineExceeded):
++		return "timeout"
++	case errors.Is(err, syscall.ECONNREFUSED):
++		return "refused"
++	case errors.Is(err, syscall.ECONNRESET):
++		return "reset"
++	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
++		return "unreachable"
++	}
++	var netErr net.Error
++	if errors.As(err, &netErr) && netErr.Timeout() {
++		return "timeout"
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) {
++		return "dns"
++	}
++	return "other"
++}
+diff --git a/tunnel/evidence_test.go b/tunnel/evidence_test.go
+new file mode 100644
+index 00000000..7f5b23ae
+--- /dev/null
++++ b/tunnel/evidence_test.go
+@@ -0,0 +1,68 @@
++package tunnel
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"syscall"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestNotifyFlowEvidenceCopiesMetadata(t *testing.T) {
++	previous := DefaultFlowEvidenceNotify
++	t.Cleanup(func() { DefaultFlowEvidenceNotify = previous })
++
++	var got FlowEvidence
++	DefaultFlowEvidenceNotify = func(event FlowEvidence) {
++		got = event
++	}
++	metadata := &C.Metadata{
++		NetWork: C.TCP,
++		Type:    C.TUN,
++		SrcIP:   netip.MustParseAddr("10.0.0.2"),
++		SrcPort: 42000,
++		DstIP:   netip.MustParseAddr("203.0.113.8"),
++		DstPort: 443,
++		Host:    "example.test",
++		InName:  "tun0",
++		Uid:     10042,
++	}
++
++	notifyFlowEvidence(FlowEvidenceIngress, metadata, nil, nil, nil, time.Second)
++	metadata.Host = "changed.test"
++	metadata.SrcPort = 1
++
++	if got.Stage != FlowEvidenceIngress || got.SourcePort != 42000 || got.TargetHost != "example.test" {
++		t.Fatalf("unexpected copied event: %+v", got)
++	}
++	if got.Network != C.TCP || got.InboundType != C.TUN || got.Duration != time.Second {
++		t.Fatalf("missing normalized metadata: %+v", got)
++	}
++}
++
++func TestFlowErrorClass(t *testing.T) {
++	tests := []struct {
++		name string
++		err  error
++		want string
++	}{
++		{name: "none", want: ""},
++		{name: "cancelled", err: context.Canceled, want: "cancelled"},
++		{name: "deadline", err: context.DeadlineExceeded, want: "timeout"},
++		{name: "refused", err: syscall.ECONNREFUSED, want: "refused"},
++		{name: "reset", err: syscall.ECONNRESET, want: "reset"},
++		{name: "unreachable", err: syscall.ENETUNREACH, want: "unreachable"},
++		{name: "wrapped", err: errors.Join(errors.New("dial"), syscall.EHOSTUNREACH), want: "unreachable"},
++		{name: "other", err: errors.New("opaque"), want: "other"},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := flowErrorClass(test.err); got != test.want {
++				t.Fatalf("flowErrorClass() = %q, want %q", got, test.want)
++			}
++		})
++	}
++}
+diff --git a/tunnel/patch.go b/tunnel/patch.go
+index d3ae861a..7f900b0c 100644
+--- a/tunnel/patch.go
++++ b/tunnel/patch.go
+@@ -1,6 +1,7 @@
+ package tunnel
+ 
+ import (
++	"fmt"
+ 	"sync"
+ 
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -121,3 +122,38 @@ func ResolveRoute(metadata *C.Metadata) (C.Proxy, error) {
+ 	proxy, _, err := resolveMetadata(metadata)
+ 	return proxy, err
+ }
++
++// DirectSplitHook lets the host send a connection an explicit DIRECT rule
++// matched through another proxy, by name; empty keeps it direct. ReClash uses
++// it where direct access to home sites is lost. It runs on every such match,
++// under the config lock, and must not block.
++var DirectSplitHook func(metadata *C.Metadata) string
++
++// SiteLockHook lets the host claim a connection before the mode, any rule or
++// a listener's own proxy is consulted: a non-nil proxy is used as is, and rule
++// names the claim. Only the inner listener's connections skip it. It runs
++// outside the config lock, may use helper's lazy lookups, and must not block
++// beyond them.
++var SiteLockHook func(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule)
++
++func specialProxy(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
++	if proxy, ok := proxies[metadata.SpecialProxy]; ok {
++		return proxy, nil, nil
++	}
++	return nil, nil, fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
++}
++
++var MetadataPolicyHook func(metadata *C.Metadata) error
++var ModeChangeHook func(mode TunnelMode)
++
++// The final MATCH rule is not split: "proxy everything" is never implied.
++func directSplit(metadata *C.Metadata, adapter C.Proxy, rule C.Rule) C.Proxy {
++	if DirectSplitHook == nil || adapter.Type() != C.Direct || rule.RuleType() == C.MATCH {
++		return nil
++	}
++	target, ok := proxies[DirectSplitHook(metadata)]
++	if !ok || metadata.NetWork == C.UDP && !target.SupportUDP() {
++		return nil
++	}
++	return target
++}
+diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
+index eeb3cd4f..bb42160b 100644
+--- a/tunnel/statistic/manager.go
++++ b/tunnel/statistic/manager.go
+@@ -44,10 +44,14 @@ type Manager struct {
+ }
+ 
+ func (m *Manager) Join(c Tracker) {
++	m.connections.Store(c.ID(), c)
++	if DefaultConnectionAdmission != nil && !DefaultConnectionAdmission(c) {
++		m.connections.Delete(c.ID())
++		return
++	}
+ 	if DefaultRequestNotify != nil {
+ 		DefaultRequestNotify(c)
+ 	}
+-	m.connections.Store(c.ID(), c)
+ }
+ 
+ func (m *Manager) Leave(c Tracker) {
+diff --git a/tunnel/statistic/patch.go b/tunnel/statistic/patch.go
+index e3e11f37..ade37858 100644
+--- a/tunnel/statistic/patch.go
++++ b/tunnel/statistic/patch.go
+@@ -2,7 +2,11 @@ package statistic
+ 
+ type RequestNotify func(c Tracker)
+ 
+-var DefaultRequestNotify RequestNotify
++var (
++	DefaultConnectionAdmission func(Tracker) bool
++	DefaultRequestNotify       RequestNotify
++	DefaultFirstProgressNotify RequestNotify
++)
+ 
+ // IsDirect reports whether the named outbound reaches the destination without
+ // a proxy. A direct proxy may carry any name, so the tunnel, which knows each
+diff --git a/tunnel/statistic/progress_test.go b/tunnel/statistic/progress_test.go
+new file mode 100644
+index 00000000..8818eeb1
+--- /dev/null
++++ b/tunnel/statistic/progress_test.go
+@@ -0,0 +1,36 @@
++package statistic
++
++import "testing"
++
++func TestTCPTrackerFirstProgressOnly(t *testing.T) {
++	previous := DefaultFirstProgressNotify
++	t.Cleanup(func() { DefaultFirstProgressNotify = previous })
++
++	calls := 0
++	DefaultFirstProgressNotify = func(Tracker) { calls++ }
++	tracker := &tcpTracker{}
++
++	tracker.notifyProgress(0)
++	tracker.notifyProgress(2)
++	tracker.notifyProgress(3)
++
++	if calls != 1 {
++		t.Fatalf("progress notifications = %d, want 1", calls)
++	}
++}
++
++func TestUDPTrackerFirstProgressOnly(t *testing.T) {
++	previous := DefaultFirstProgressNotify
++	t.Cleanup(func() { DefaultFirstProgressNotify = previous })
++
++	calls := 0
++	DefaultFirstProgressNotify = func(Tracker) { calls++ }
++	tracker := &udpTracker{}
++
++	tracker.notifyProgress(1)
++	tracker.notifyProgress(1)
++
++	if calls != 1 {
++		t.Fatalf("progress notifications = %d, want 1", calls)
++	}
++}
+diff --git a/tunnel/statistic/tracker.go b/tunnel/statistic/tracker.go
+index 78a53c8c..42f2ef25 100644
+--- a/tunnel/statistic/tracker.go
++++ b/tunnel/statistic/tracker.go
+@@ -36,7 +36,8 @@ type TrackerInfo struct {
+ type tcpTracker struct {
+ 	C.Conn `json:"-"`
+ 	*TrackerInfo
+-	manager *Manager
++	manager  *Manager
++	progress atomic.Bool
+ 
+ 	pushToManager bool `json:"-"`
+ 	direct        bool `json:"-"`
+@@ -50,6 +51,15 @@ func (tt *tcpTracker) Info() *TrackerInfo {
+ 	return tt.TrackerInfo
+ }
+ 
++func (tt *tcpTracker) notifyProgress(size int64) {
++	if size <= 0 || !tt.progress.CompareAndSwap(false, true) {
++		return
++	}
++	if DefaultFirstProgressNotify != nil {
++		DefaultFirstProgressNotify(tt)
++	}
++}
++
+ func (tt *tcpTracker) Read(b []byte) (int, error) {
+ 	n, err := tt.Conn.Read(b)
+ 	download := int64(n)
+@@ -57,6 +67,7 @@ func (tt *tcpTracker) Read(b []byte) (int, error) {
+ 		tt.manager.PushDownloaded(tt.direct, download)
+ 	}
+ 	tt.DownloadTotal.Add(download)
++	tt.notifyProgress(download)
+ 	return n, err
+ }
+ 
+@@ -67,6 +78,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
+ 		tt.manager.PushDownloaded(tt.direct, download)
+ 	}
+ 	tt.DownloadTotal.Add(download)
++	tt.notifyProgress(download)
+ 	return
+ }
+ 
+@@ -76,6 +88,7 @@ func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
+ 			tt.manager.PushDownloaded(tt.direct, download)
+ 		}
+ 		tt.DownloadTotal.Add(download)
++		tt.notifyProgress(download)
+ 	}}
+ }
+ 
+@@ -86,6 +99,7 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
+ 		tt.manager.PushUploaded(tt.direct, upload)
+ 	}
+ 	tt.UploadTotal.Add(upload)
++	tt.notifyProgress(upload)
+ 	return n, err
+ }
+ 
+@@ -96,6 +110,7 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
+ 		tt.manager.PushUploaded(tt.direct, upload)
+ 	}
+ 	tt.UploadTotal.Add(upload)
++	tt.notifyProgress(upload)
+ 	return
+ }
+ 
+@@ -105,6 +120,7 @@ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
+ 			tt.manager.PushUploaded(tt.direct, upload)
+ 		}
+ 		tt.UploadTotal.Add(upload)
++		tt.notifyProgress(upload)
+ 	}}
+ }
+ 
+@@ -152,13 +168,15 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
+ 	}
+ 
+ 	manager.Join(tt)
++	tt.notifyProgress(uploadTotal + downloadTotal)
+ 	return tt
+ }
+ 
+ type udpTracker struct {
+ 	C.PacketConn `json:"-"`
+ 	*TrackerInfo
+-	manager *Manager
++	manager  *Manager
++	progress atomic.Bool
+ 
+ 	pushToManager bool `json:"-"`
+ 	direct        bool `json:"-"`
+@@ -172,6 +190,15 @@ func (ut *udpTracker) Info() *TrackerInfo {
+ 	return ut.TrackerInfo
+ }
+ 
++func (ut *udpTracker) notifyProgress(size int64) {
++	if size <= 0 || !ut.progress.CompareAndSwap(false, true) {
++		return
++	}
++	if DefaultFirstProgressNotify != nil {
++		DefaultFirstProgressNotify(ut)
++	}
++}
++
+ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
+ 	n, addr, err := ut.PacketConn.ReadFrom(b)
+ 	download := int64(n)
+@@ -179,6 +206,7 @@ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
+ 		ut.manager.PushDownloaded(ut.direct, download)
+ 	}
+ 	ut.DownloadTotal.Add(download)
++	ut.notifyProgress(download)
+ 	return n, addr, err
+ }
+ 
+@@ -189,6 +217,7 @@ func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, er
+ 		ut.manager.PushDownloaded(ut.direct, download)
+ 	}
+ 	ut.DownloadTotal.Add(download)
++	ut.notifyProgress(download)
+ 	return
+ }
+ 
+@@ -199,6 +228,7 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
+ 		ut.manager.PushUploaded(ut.direct, upload)
+ 	}
+ 	ut.UploadTotal.Add(upload)
++	ut.notifyProgress(upload)
+ 	return n, err
+ }
+ 
+@@ -246,5 +276,6 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
+ 	}
+ 
+ 	manager.Join(ut)
++	ut.notifyProgress(uploadTotal + downloadTotal)
+ 	return ut
+ }
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 92afa706..0eeb0822 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -78,6 +78,7 @@ var _ P.Tunnel = Tunnel
+ var _ proxydialer.Tunnel = Tunnel
+ 
+ func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
++	notifyFlowEvidence(FlowEvidenceIngress, metadata, nil, nil, nil, 0)
+ 	connCtx := icontext.NewConnContext(conn, metadata)
+ 	handleTCPConn(connCtx)
+ }
+@@ -97,6 +98,7 @@ func initUDP() {
+ }
+ 
+ func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
++	notifyFlowEvidence(FlowEvidenceIngress, metadata, nil, nil, nil, 0)
+ 	udpInit.Do(initUDP)
+ 
+ 	packetAdapter := C.NewPacketAdapter(packet, metadata)
+@@ -255,6 +257,9 @@ func Mode() TunnelMode {
+ 
+ // SetMode change the mode of tunnel
+ func SetMode(m TunnelMode) {
++	if mode != m && ModeChangeHook != nil {
++		ModeChangeHook(m)
++	}
+ 	mode = m
+ }
+ 
+@@ -316,13 +321,14 @@ func preHandleMetadata(metadata *C.Metadata) error {
+ }
+ 
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+-	if metadata.SpecialProxy != "" {
+-		var exist bool
+-		proxy, exist = proxies[metadata.SpecialProxy]
+-		if !exist {
+-			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
++	metadata.PolicyGlobal = metadata.PolicyGlobal || mode == Global
++	if MetadataPolicyHook != nil {
++		if err := MetadataPolicyHook(metadata); err != nil {
++			return nil, nil, err
+ 		}
+-		return
++	}
++	if metadata.SpecialProxy != "" && (SiteLockHook == nil || metadata.Type == C.INNER) {
++		return specialProxy(metadata)
+ 	}
+ 	var (
+ 		resolved             bool
+@@ -399,6 +405,15 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 		helper.FindProcess = nil
+ 	}
+ 
++	if SiteLockHook != nil {
++		if locked, claim := SiteLockHook(metadata, helper); locked != nil {
++			return locked, claim, nil
++		}
++	}
++	if metadata.SpecialProxy != "" {
++		return specialProxy(metadata)
++	}
++
+ 	switch mode {
+ 	case Direct:
+ 		proxy = proxies["DIRECT"]
+@@ -435,6 +450,7 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
+ 		packet.Drop()
+ 		log.Debugln("[Metadata PreHandle] error: %s", err)
++		notifyFlowEvidence(FlowEvidencePreHandleFailed, metadata, nil, nil, err, 0)
+ 		return
+ 	}
+ 
+@@ -461,17 +477,22 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 			proxy, rule, err := resolveMetadata(metadata)
+ 			if err != nil {
+ 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
++				notifyFlowEvidence(FlowEvidenceRouteFailed, metadata, rule, proxy, err, 0)
+ 				return nil, nil, err
+ 			}
++			notifyFlowEvidence(FlowEvidenceRouteResolved, metadata, rule, proxy, nil, 0)
+ 
+ 			dialMetadata := metadata.Pure()
+ 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+ 			defer cancel()
++			dialStarted := time.Now()
++			notifyFlowEvidence(FlowEvidenceDialStarted, metadata, rule, proxy, nil, 0)
+ 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
+ 				return proxy.ListenPacketContext(ctx, dialMetadata)
+ 			}, func(err error) {
+ 				logMetadataErr(metadata, rule, proxy, err)
+ 			})
++			notifyFlowEvidence(FlowEvidenceDialFinished, metadata, rule, proxy, err, time.Since(dialStarted))
+ 			if err != nil {
+ 				return nil, nil, err
+ 			}
+@@ -536,8 +557,10 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 
+ 	// If both trials have failed, we can do nothing but give up
+ 	if preHandleFailed {
++		err := errors.New("metadata pre-handle failed")
+ 		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
+ 			metadata.SourceDetail(), metadata.RemoteAddress())
++		notifyFlowEvidence(FlowEvidencePreHandleFailed, metadata, nil, nil, err, 0)
+ 		return
+ 	}
+ 
+@@ -555,8 +578,10 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 	proxy, rule, err := resolveMetadata(metadata)
+ 	if err != nil {
+ 		log.Warnln("[Metadata] parse failed: %s", err.Error())
++		notifyFlowEvidence(FlowEvidenceRouteFailed, metadata, rule, proxy, err, 0)
+ 		return
+ 	}
++	notifyFlowEvidence(FlowEvidenceRouteResolved, metadata, rule, proxy, nil, 0)
+ 
+ 	dialMetadata := metadata
+ 	if len(metadata.Host) > 0 {
+@@ -574,6 +599,8 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+ 	defer cancel()
++	dialStarted := time.Now()
++	notifyFlowEvidence(FlowEvidenceDialStarted, metadata, rule, proxy, nil, 0)
+ 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
+ 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
+ 		if err != nil {
+@@ -608,6 +635,7 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 	}, func(err error) {
+ 		logMetadataErr(metadata, rule, proxy, err)
+ 	})
++	notifyFlowEvidence(FlowEvidenceDialFinished, metadata, rule, proxy, err, time.Since(dialStarted))
+ 	if err != nil {
+ 		return
+ 	}
+@@ -687,6 +715,9 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
+ 					continue
+ 				}
+ 
++				if split := directSplit(metadata, adapter, rule); split != nil {
++					return split, rule, nil
++				}
+ 				return adapter, rule, nil
+ 			}
+ 		}

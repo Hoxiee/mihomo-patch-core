@@ -1,0 +1,37 @@
+# mihomo-patch-core apply order.
+# Host integration first, then Xray compatibility, then local adaptations.
+host/0001-flclash-host-integration.patch
+host/0002-reclash-host-integration.patch
+xray/0001-reality-configurable-client-version.patch
+xray/0002-reality-adaptive-mlkem.patch
+xray/0003-vless-xdrive.patch
+xray/0004-reality-per-proxy-client-version.patch
+xray/0006-reality-mldsa65-verify.patch
+xray/0007-tls-xray-fingerprint-names.patch
+xray/0008-tls-pin-and-name-lists.patch
+xray/0009-ech-xray-forms.patch
+xray/0010-openvpn-server-identity.patch
+xray/0011-quic-disable-mtu-discovery.patch
+xray/0012-tcp-connect-timeout.patch
+xray/0013-sniffer-skip-threshold.patch
+xray/0014-dns-serve-expired.patch
+xray/0023-reality-pq-browser-hellos.patch
+xray/0026-tls-chrome155.patch
+xray/0027-reality-mlkem-memo-outcomes.patch
+xray/0028-reality-client-version-26-11-9.patch
+xray/0029-xhttp-uplink-data-key-default.patch
+xray/0030-xdrive-muxcool-citrus-fixes.patch
+xray/0031-reality-mlkem-client-fingerprint.patch
+xray/0032-reality-default-fingerprint.patch
+xray/0033-proxy-fragment-opts.patch
+xray/0034-gun-frame-reader.patch
+xray/0035-xhttp-conn-deadlines.patch
+xray/0036-share-link-log-redaction.patch
+xray/0037-vless-mux-cool.patch
+xray/0038-xhttp-packet-up-pipelining.patch
+xray/0039-snell-unsafe-raw-warning.patch
+xray/0040-proxy-options-graceful.patch
+xray/0041-finalmask.patch
+xray/0042-finalmask-xdns-compact.patch
+xray/0043-tls-firefox160.patch
+compat/0001-finalmask-android-guard.patch

@@ -1,0 +1,15 @@
+./component/tls/
+./component/ca/
+./component/sniffer/
+./dns/
+./tunnel/
+./transport/finalmask/...
+./transport/xdrive/
+./transport/muxcool/
+./transport/xhttp/
+./transport/gun/
+./adapter/
+./adapter/outbound/
+./adapter/outboundgroup/
+./config/
+./hub/route/

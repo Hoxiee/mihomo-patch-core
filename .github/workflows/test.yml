@@ -1,0 +1,17 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  series:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Apply the series and test the patched packages
+        run: ./tool/test.sh
