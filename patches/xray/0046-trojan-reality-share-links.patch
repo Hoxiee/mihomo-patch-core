@@ -1,0 +1,54 @@
+mihomo-patch-core: xray/0046-trojan-reality-share-links
+Source: Prizrak-Core/ClashFest share-link handling (GPL-3.0), completing 0045 for Trojan REALITY links.
+
+diff --git a/common/convert/converter.go b/common/convert/converter.go
+index 7b6357c..a540ac6 100644
+--- a/common/convert/converter.go
++++ b/common/convert/converter.go
+@@ -221,6 +221,21 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
+ 			if vcn := query.Get("vcn"); vcn != "" {
+ 				trojan["name-cert-verify"] = vcn
+ 			}
++			if pbk := query.Get("pbk"); pbk != "" {
++				realityOpts := map[string]any{
++					"public-key": pbk,
++					"short-id":   query.Get("sid"),
++				}
++				if value := query.Get("support-x25519mlkem768"); value != "" {
++					if enabled, err := strconv.ParseBool(value); err == nil {
++						realityOpts["support-x25519mlkem768"] = enabled
++					}
++				}
++				if pqv := query.Get("pqv"); pqv != "" {
++					realityOpts["mldsa65-verify"] = pqv
++				}
++				trojan["reality-opts"] = realityOpts
++			}
+ 			applyFinalMask(trojan, query)
+ 
+ 			proxies = append(proxies, trojan)
+diff --git a/common/convert/xray_params_test.go b/common/convert/xray_params_test.go
+index b6e3a15..8381a8e 100644
+--- a/common/convert/xray_params_test.go
++++ b/common/convert/xray_params_test.go
+@@ -72,3 +72,20 @@ func TestConvertsV2RayInvalidFMKeepsProxy(t *testing.T) {
+ 	require.Len(t, proxies, 1)
+ 	assert.NotContains(t, proxies[0], "finalmask")
+ }
++
++func TestConvertsV2RayTrojanReality(t *testing.T) {
++	pqv := base64.RawURLEncoding.EncodeToString(make([]byte, 1952))
++	link := "trojan://pass%40word@example.com:443?type=tcp&security=reality&sni=example.com&fp=chrome&pbk=ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw&sid=ab&pqv=" + pqv + "&support-x25519mlkem768=true&vcn=real.example.com#t"
++	proxies, err := ConvertsV2Ray([]byte(link))
++	require.NoError(t, err)
++	p := proxies[0]
++	assert.Equal(t, map[string]any{
++		"public-key":             "ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw",
++		"short-id":               "ab",
++		"support-x25519mlkem768": true,
++		"mldsa65-verify":         pqv,
++	}, p["reality-opts"])
++	assert.Equal(t, "real.example.com", p["name-cert-verify"])
++	_, err = adapter.ParseProxy(p)
++	require.NoError(t, err)
++}

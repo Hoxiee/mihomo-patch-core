@@ -1,0 +1,156 @@
+mihomo-patch-core: reclash/0010-geo-digest
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/component/updater/patch.go b/component/updater/patch.go
+index 02096ab..a6853ca 100644
+--- a/component/updater/patch.go
++++ b/component/updater/patch.go
+@@ -2,9 +2,18 @@ package updater
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"io"
++	"os"
++	"strings"
+ 	"sync"
++	"time"
+ 
++	mihomoHttp "github.com/metacubex/mihomo/component/http"
+ 	"github.com/metacubex/mihomo/log"
++
++	"github.com/metacubex/http"
+ )
+ 
+ var (
+@@ -17,6 +26,77 @@ func sendGeoUpdateStatus(geoType string, updating bool, skipped bool, updateErr
+ 	}
+ }
+ 
++// meta-rules-dat publishes a digest next to every database; a match means the
++// multi-megabyte body would be byte-identical, so it is never fetched.
++var geoDigestSuffixes = []string{".sha256sum", ".sha256"}
++
++const (
++	geoDigestTimeout = time.Second * 15
++	geoDigestLimit   = 1 << 12
++)
++
++// A skipped download still refreshes mtime, which is what schedules the next run.
++func skipGeoDownload(url string, path string) bool {
++	local, err := os.ReadFile(path)
++	if err != nil || len(local) == 0 {
++		return false
++	}
++	remote, ok := fetchGeoDigest(url)
++	if !ok || remote != hex.EncodeToString(sha256Sum(local)) {
++		return false
++	}
++	now := time.Now()
++	_ = os.Chtimes(path, now, now)
++	log.Infoln("[GEO] %s matches the published digest, download skipped", path)
++	return true
++}
++
++func sha256Sum(data []byte) []byte {
++	sum := sha256.Sum256(data)
++	return sum[:]
++}
++
++func fetchGeoDigest(url string) (string, bool) {
++	for _, suffix := range geoDigestSuffixes {
++		digest, ok := requestGeoDigest(url + suffix)
++		if ok {
++			return digest, true
++		}
++	}
++	return "", false
++}
++
++func requestGeoDigest(url string) (string, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), geoDigestTimeout)
++	defer cancel()
++
++	resp, err := mihomoHttp.HttpRequest(ctx, url, http.MethodGet, nil, nil)
++	if err != nil {
++		return "", false
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		return "", false
++	}
++	body, err := io.ReadAll(io.LimitReader(resp.Body, geoDigestLimit))
++	if err != nil {
++		return "", false
++	}
++	fields := strings.Fields(string(body))
++	if len(fields) == 0 {
++		return "", false
++	}
++	digest := strings.ToLower(fields[0])
++	if len(digest) != sha256.Size*2 {
++		return "", false
++	}
++	if _, err := hex.DecodeString(digest); err != nil {
++		return "", false
++	}
++	return digest, true
++}
++
+ var (
+ 	geoUpdateMutex  sync.Mutex
+ 	geoUpdateCancel context.CancelFunc
+diff --git a/component/updater/update_geo.go b/component/updater/update_geo.go
+index 2298338..1a0b769 100644
+--- a/component/updater/update_geo.go
++++ b/component/updater/update_geo.go
+@@ -49,6 +49,11 @@ func UpdateMMDB() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("MMDB", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.MmdbUrl(), C.Path.MMDB()) {
++		skipped = true
++		return nil
++	}
++
+ 	vehicle := resource.NewHTTPVehicle(geodata.MmdbUrl(), C.Path.MMDB(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -86,6 +91,11 @@ func UpdateASN() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("ASN", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.ASNUrl(), C.Path.ASN()) {
++		skipped = true
++		return nil
++	}
++
+ 	vehicle := resource.NewHTTPVehicle(geodata.ASNUrl(), C.Path.ASN(), "", nil, defaultHttpTimeout, 0)
+ 	var oldHash utils.HashType
+ 	if buf, err := os.ReadFile(vehicle.Path()); err == nil {
+@@ -123,6 +133,11 @@ func UpdateGeoIp() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("GEOIP", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.GeoIpUrl(), C.Path.GeoIP()) {
++		skipped = true
++		return nil
++	}
++
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+ 
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoIpUrl(), C.Path.GeoIP(), "", nil, defaultHttpTimeout, 0)
+@@ -159,6 +174,11 @@ func UpdateGeoSite() (err error) {
+ 	var skipped bool
+ 	defer func() { sendGeoUpdateStatus("GEOSITE", false, skipped, err) }()
+ 
++	if skipGeoDownload(geodata.GeoSiteUrl(), C.Path.GeoSite()) {
++		skipped = true
++		return nil
++	}
++
+ 	geoLoader, err := geodata.GetGeoDataLoader("standard")
+ 
+ 	vehicle := resource.NewHTTPVehicle(geodata.GeoSiteUrl(), C.Path.GeoSite(), "", nil, defaultHttpTimeout, 0)

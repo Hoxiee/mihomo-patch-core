@@ -1,0 +1,242 @@
+mihomo-patch-core: reclash/0004-provider-health-scheduling
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/adapter/provider/healthcheck.go b/adapter/provider/healthcheck.go
+index 822a00d..0ec7157 100644
+--- a/adapter/provider/healthcheck.go
++++ b/adapter/provider/healthcheck.go
+@@ -39,21 +39,59 @@ type HealthCheck struct {
+ 	lastTouch      atomic.TypedValue[time.Time]
+ 	singleDo       *singledo.Single[struct{}]
+ 	timeout        time.Duration
++	owner          string
++}
++
++type hcTickAction int
++
++const (
++	hcRun hcTickAction = iota
++	hcDefer
++	hcSkip
++)
++
++// The routing engine, when it drives selection, is the single prover, so its
++// auto check is suppressed to avoid probing every node twice. Screen state wins
++// over recency next: a pocketed phone keeps touching groups from background
++// traffic, so `since < interval` alone fans out URLTests to every node while the
++// screen is off - the tunnel's main idle radio wake-up.
++func hcTickDecision(suppressed, screenOff bool, sinceTouch, interval time.Duration, lazy bool) hcTickAction {
++	switch {
++	case suppressed:
++		return hcDefer
++	case screenOff:
++		return hcDefer
++	case sinceTouch < interval:
++		return hcRun
++	case lazy:
++		return hcSkip
++	default:
++		return hcRun
++	}
+ }
+ 
+ func (hc *HealthCheck) process() {
+ 	ticker := time.NewTicker(hc.interval)
+ 	go hc.check()
++	var deferred bool
+ 	for {
+ 		select {
+ 		case <-ticker.C:
+-			lastTouch := hc.lastTouch.Load()
+-			since := time.Since(lastTouch)
+-			if !hc.lazy || since < hc.interval {
+-				hc.check()
+-			} else {
++			switch hcTickDecision(autoHealthCheckSuppressed(hc.owner), screenOff(), time.Since(hc.lastTouch.Load()), hc.interval, hc.lazy) {
++			case hcDefer:
++				deferred = true
++				log.Debugln("Defer health check until the screen comes back")
++			case hcSkip:
+ 				log.Debugln("Skip once health check because we are lazy")
++			default:
++				hc.check()
++			}
++		case <-screenWake():
++			if !deferred {
++				continue
+ 			}
++			deferred = false
++			hc.check()
+ 		case <-hc.ctx.Done():
+ 			ticker.Stop()
+ 			return
+diff --git a/adapter/provider/healthcheck_screen_test.go b/adapter/provider/healthcheck_screen_test.go
+new file mode 100644
+index 0000000..23e8483
+--- /dev/null
++++ b/adapter/provider/healthcheck_screen_test.go
+@@ -0,0 +1,55 @@
++package provider
++
++import (
++	"testing"
++	"time"
++)
++
++func TestHCTickDecision(t *testing.T) {
++	const interval = 5 * time.Minute
++	cases := []struct {
++		name       string
++		suppressed bool
++		screenOff  bool
++		sinceTouch time.Duration
++		lazy       bool
++		want       hcTickAction
++	}{
++		{"routing engine as sole prover defers the auto check", true, false, time.Second, false, hcDefer},
++		{"suppressed wins even with the screen on", true, false, time.Second, true, hcDefer},
++		{"screen off defers even when recently touched", false, true, time.Second, false, hcDefer},
++		{"screen off defers a lazy idle group", false, true, 10 * time.Minute, true, hcDefer},
++		{"screen on, recently touched, runs", false, false, time.Second, false, hcRun},
++		{"screen on, recently touched, runs even if lazy", false, false, time.Second, true, hcRun},
++		{"screen on, idle and lazy, skips", false, false, 10 * time.Minute, true, hcSkip},
++		{"screen on, idle and eager, runs", false, false, 10 * time.Minute, false, hcRun},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := hcTickDecision(c.suppressed, c.screenOff, c.sinceTouch, interval, c.lazy); got != c.want {
++				t.Fatalf("got %d, want %d", got, c.want)
++			}
++		})
++	}
++}
++
++func TestAutoHealthCheckSuppressionIsPerProvider(t *testing.T) {
++	t.Cleanup(func() { SetAutoHealthCheckSuppressed(nil) })
++	SetAutoHealthCheckSuppressed([]string{"smart"})
++	if !autoHealthCheckSuppressed("smart") || autoHealthCheckSuppressed("other") {
++		t.Fatal("suppression leaked across providers")
++	}
++	wake := screenWake()
++	SetAutoHealthCheckSuppressed([]string{"smart", "more"})
++	select {
++	case <-wake:
++		t.Fatal("adding a provider flushed deferred checks")
++	default:
++	}
++	SetAutoHealthCheckSuppressed([]string{"more"})
++	select {
++	case <-wake:
++	default:
++		t.Fatal("a released provider kept its deferred check waiting")
++	}
++}
+diff --git a/adapter/provider/patch.go b/adapter/provider/patch.go
+index 1f3306a..bd680b2 100644
+--- a/adapter/provider/patch.go
++++ b/adapter/provider/patch.go
+@@ -1,5 +1,76 @@
+ package provider
+ 
++import "sync"
++
+ func (pp *proxySetProvider) GetSubscriptionInfo() *SubscriptionInfo {
+ 	return pp.subscriptionInfo
+ }
++
++var (
++	screenMu     sync.Mutex
++	screenIsOff  bool
++	hcSuppressed map[string]struct{}
++	screenWakeCh = make(chan struct{})
++)
++
++// Periodic probes are the tunnel's main idle-time radio wake-up, and a group
++// nothing routed through while the screen was off has no reason to be probed.
++// The tick is deferred rather than dropped: it runs when the screen comes back,
++// so the delays a user sees are never the ones measured in their pocket.
++func SetScreenOff(off bool) {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	if screenIsOff == off {
++		return
++	}
++	screenIsOff = off
++	if off {
++		return
++	}
++	close(screenWakeCh)
++	screenWakeCh = make(chan struct{})
++}
++
++func screenOff() bool {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	return screenIsOff
++}
++
++// SetAutoHealthCheckSuppressed pauses the auto health check of the named
++// providers while the routing engine is their single prover, so their nodes are
++// not probed twice; other providers keep checking and the engine harvests their
++// results. A provider leaving the set flushes its deferred tick at once.
++func SetAutoHealthCheckSuppressed(providers []string) {
++	next := make(map[string]struct{}, len(providers))
++	for _, name := range providers {
++		next[name] = struct{}{}
++	}
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	released := false
++	for name := range hcSuppressed {
++		if _, kept := next[name]; !kept {
++			released = true
++		}
++	}
++	hcSuppressed = next
++	if !released {
++		return
++	}
++	close(screenWakeCh)
++	screenWakeCh = make(chan struct{})
++}
++
++func autoHealthCheckSuppressed(provider string) bool {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	_, suppressed := hcSuppressed[provider]
++	return suppressed
++}
++
++func screenWake() <-chan struct{} {
++	screenMu.Lock()
++	defer screenMu.Unlock()
++	return screenWakeCh
++}
+diff --git a/adapter/provider/provider.go b/adapter/provider/provider.go
+index fa7d56b..95d952e 100644
+--- a/adapter/provider/provider.go
++++ b/adapter/provider/provider.go
+@@ -182,6 +182,7 @@ func (pp *proxySetProvider) Close() error {
+ }
+ 
+ func NewProxySetProvider(name string, interval time.Duration, payload []map[string]any, parser resource.Parser[[]C.Proxy], vehicle P.Vehicle, hc *HealthCheck) (*ProxySetProvider, error) {
++	hc.owner = name
+ 	pd := &proxySetProvider{
+ 		baseProvider: baseProvider{
+ 			name:        name,
+@@ -259,6 +260,7 @@ func (ip *inlineProvider) Update() error {
+ }
+ 
+ func NewInlineProvider(name string, payload []map[string]any, parser resource.Parser[[]C.Proxy], hc *HealthCheck) (*InlineProvider, error) {
++	hc.owner = name
+ 	ps := ProxySchema{Proxies: payload}
+ 	buf, err := yaml.Marshal(ps)
+ 	if err != nil {
+@@ -318,6 +320,7 @@ func (cp *compatibleProvider) VehicleType() P.VehicleType {
+ }
+ 
+ func NewCompatibleProvider(name string, proxies []C.Proxy, hc *HealthCheck) (*CompatibleProvider, error) {
++	hc.owner = name
+ 	if len(proxies) == 0 {
+ 		return nil, errors.New("provider need one proxy at least")
+ 	}

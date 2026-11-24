@@ -5,12 +5,16 @@ proxy core ReClash runs. The upstream tree stays unmodified; every behaviour ReC
 numbered, reviewable patch that can be rebased or deleted on its own.
 
 The series is consumed by [ReClash](https://github.com/Hoxiee/ReClash) and is not a standalone
-proxy distribution. It replaces the long-lived `Hoxiee/mihomo` fork with two explicit layers:
+proxy distribution. It replaces the long-lived `Hoxiee/mihomo` fork with explicit layers:
 
-- **host** — FlClash and ReClash integration: lifecycle, hooks, flow evidence, route identity,
-  battery-aware health checks, direct split, listener ownership.
+- **host** — FlClash host integration, taken from the FlClash repository; it keeps the
+  `feat: support FlClash` contract and is not ReClash-specific.
+- **reclash** — ReClash product logic, split from the former `feat: support ReClash` commit:
+  external adapters, proxy metadata, dial hooks, health scheduling, diagnostics, site lock,
+  policy hooks, direct split, geo digests and listener plumbing. Each concern is a separate patch.
 - **xray** — client-side Xray compatibility: REALITY, TLS fingerprints, ECH, mux.cool, finalmask,
-  XHTTP, XDRIVE.
+  XHTTP, XDRIVE, and share-link conversion.
+- **diagnostics** — probe error details and the transfer-level test.
 - **compat** — small adaptations where the Xray patches assume a different host environment.
 
 The current status is **initial series**: it applies and its packages pass their tests on the
@@ -33,8 +37,10 @@ the series, and fixing the first patch that no longer applies.
 ```
 patches/
   order.txt                 apply order, one patch per line
-  host/                     FlClash + ReClash host integration (required)
+  host/                     FlClash host integration (from FlClash)
+  reclash/                  ReClash product layers, one concern per patch
   xray/                     client-side Xray compatibility
+  diagnostics/              probe and transfer diagnostics
   compat/                   adaptations to the host layer
 tool/
   patch.sh                  list / status / check / apply / revert
@@ -84,16 +90,42 @@ ships with. Tests that need an Xray binary or external network skip themselves.
 
 | Layer | Patches | What it carries |
 |---|---:|---|
-| host | 2 | FlClash integration, then ReClash additions |
-| xray | 32 | REALITY/TLS/ECH, XHTTP, mux.cool, XDRIVE, finalmask, fragment, quality/security |
+| host | 1 | FlClash host integration |
+| reclash | 12 | external adapters, proxy metadata, dial hooks, health scheduling, flow and connection diagnostics, site lock, policy hooks, direct split, geo digests, listener plumbing |
+| xray | 35 | REALITY/TLS/ECH, XHTTP, mux.cool, XDRIVE, finalmask, fragment, share links, quality/security |
+| diagnostics | 3 | probe error details, transfer test and its in-process export |
 | compat | 1 | `features.CMFA` → `features.Android` in the finalmask xicmp guard |
+
+### ReClash layer
+
+The former `feat: support ReClash` commit is one concern per patch:
+
+| Patch | Concern |
+|---|---|
+| `0001-external-adapter-registry` | proxy types registered by the embedding application |
+| `0002-proxy-metadata` | annotations, route/endpoint fingerprints, route dependency, diversity |
+| `0003-dial-hooks` | dial policy, dial-result evidence, URL-test status |
+| `0004-provider-health-scheduling` | screen-off deferral and single-prover auto health checks |
+| `0005-flow-evidence` | ingress/route/dial evidence for failed connections |
+| `0006-connection-progress` | connection admission and first-progress notification |
+| `0007-policy-hooks` | metadata policy and mode-change hooks |
+| `0008-site-lock` | the host claims a connection before mode or rules |
+| `0009-direct-split` | an explicit DIRECT rule can use another proxy |
+| `0010-geo-digest` | skip a geo database body when the published digest matches |
+| `0011-listener-plumbing` | duplicate close removal and injectable TUN stack |
+| `0012-controller-serve-log` | log external-controller serve errors |
 
 ### Xray coverage
 
 - **REALITY and TLS** — configurable global and per-proxy client version, adaptive X25519MLKEM768
   policy with a per-server memo, ML-DSA-65 verification, Xray fingerprint names, comma-separated
-  certificate pins and name lists, ECH PEM/query forms, Chrome 155, Firefox 156/160, default
-  chrome for REALITY proxies without a fingerprint.
+  certificate pins and name lists, ECH PEM/query forms, Chrome 155, Firefox 156/160, and Xray's
+  current defaults: `chrome` = Chrome 155, `firefox` = Firefox 160; `chrome133` and `firefox148`
+  keep the older mihomo parrots.
+- **Share links** — `pqv` → `reality-opts.mldsa65-verify`, `vcn` → `name-cert-verify`,
+  `?serverDescription=` after the remark, the full `fm` finalmask block for VLESS and Trojan
+  (not just the fragment mask), and Trojan REALITY links (`pbk`, `sid`, `pqv`). UDP masks are
+  kept only for VLESS over XHTTP with `alpn: h3`.
 - **XHTTP** — default uplink data key, per-direction read/write deadlines, pipelined packet-up
   uploads with an 8-seq window.
 - **mux.cool** — VLESS Mux.Cool and XUDP client with carrier limits.
@@ -106,17 +138,24 @@ ships with. Tests that need an Xray binary or external network skip themselves.
   sniffer skip threshold, DNS serve-expired, gRPC frame reader hardening, share-link redaction,
   Snell `unsafe-raw` warning, graceful handling of unusable proxy options.
 
+### Diagnostics
+
+- Probe failures keep the upstream error text and log it, instead of a generic 503.
+- `GET /proxies/{name}/transfer` reads a response body with a stall watchdog, so a tunnel that
+  passes the header-only delay test but freezes after the first tens of kilobytes is visible.
+  `ProxyTransfer` exposes the same test to in-process callers.
+
 ### Not in the series yet
 
 Deliberately left out until they have a product reason and a tested integration:
 
 - desync outbounds (ClashFest 0015–0022);
 - proxy groups of type `chain` (ClashFest 0005);
-- transfer-level probes (ClashFest 0024–0025);
 - Prizrak's `smart` group, XHTTP `h2-flow`, QUIC parrots, mKCP and the server-side roles of
   mux.cool, finalmask, XDRIVE and REALITY.
 
-They can be added as new layers without changing the base.
+They can be added as new layers without changing the base. The split `reclash` layer also drops
+the former fork's comment-only edit to `component/process/process.go`; it had no behavior.
 
 ## Consuming from ReClash
 

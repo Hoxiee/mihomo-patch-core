@@ -1,0 +1,225 @@
+mihomo-patch-core: xray/0044-default-browser-fingerprints
+Source: ReClash policy over ClashFest core patches 0026/0043 (GPL-3.0).
+
+diff --git a/component/tls/chrome155.go b/component/tls/chrome155.go
+index a3dfc99..8310682 100644
+--- a/component/tls/chrome155.go
++++ b/component/tls/chrome155.go
+@@ -24,8 +24,8 @@ import (
+ // Compared with Chrome 133 the hello gains a GREASE value and three ML-DSA
+ // schemes in signature_algorithms (advertised only: no ML-DSA certificate is
+ // ever verified) and the trust_anchors extension (0xca34) with 28 Chrome Root
+-// Store IDs. "chrome" keeps mihomo's meaning (Chrome 133): non-vanilla
+-// behaviour only when the config asks for it.
++// Store IDs. ReClash core patch 0044 makes "chrome" mean this hello, as Xray
++// does; "chrome133" keeps mihomo's old meaning.
+ //
+ // Delete when mihomo moves to a utls release that ships HelloChrome_155 (then map
+ // the names to it).
+diff --git a/component/tls/chrome155_test.go b/component/tls/chrome155_test.go
+index deb3762..0ee7193 100644
+--- a/component/tls/chrome155_test.go
++++ b/component/tls/chrome155_test.go
+@@ -261,9 +261,10 @@ func TestChrome155MatchesBrowserCapture(t *testing.T) {
+ 	}
+ }
+ 
+-// "chrome" keeps mihomo's meaning (Chrome 133): the patch only adds names.
+-func TestChromeStaysVanilla(t *testing.T) {
+-	for _, name := range []string{"chrome", "chrome133", "hellochrome_133", "hellochrome_auto"} {
++// ReClash core patch 0044: "chrome" is now Chrome 155, as in Xray; the old
++// mihomo parrot stays available as chrome133 / hellochrome_133.
++func TestChromeDefaultsAndOldAlias(t *testing.T) {
++	for _, name := range []string{"chrome133", "hellochrome_133"} {
+ 		id, ok := GetFingerprint(name)
+ 		if !ok || id == HelloChrome155 {
+ 			t.Fatalf("%s = %v, %v", name, id, ok)
+@@ -273,8 +274,12 @@ func TestChromeStaysVanilla(t *testing.T) {
+ 			t.Fatalf("%s sends trust_anchors: it must stay the Chrome 133 hello", name)
+ 		}
+ 	}
+-	if id, _ := GetFingerprint("chrome"); id != utls.HelloChrome_Auto {
+-		t.Fatalf("chrome = %v, want utls.HelloChrome_Auto", id)
++	if id, _ := GetFingerprint("chrome"); id != HelloChrome155 {
++		t.Fatalf("chrome = %v, want HelloChrome155", id)
++	}
++	hello := parseClientHello(t, buildRawClientHello(t, "chrome", "www.example.com"))
++	if _, ok := hello.extensions[extensionTrustAnchors]; !ok {
++		t.Fatal("chrome does not send trust_anchors: it must be the Chrome 155 hello")
+ 	}
+ 	if id, _ := GetFingerprint("chrome133"); id != utls.HelloChrome_133 {
+ 		t.Fatalf("chrome133 = %v", id)
+diff --git a/component/tls/firefox160.go b/component/tls/firefox160.go
+index a65363b..2adf98a 100644
+--- a/component/tls/firefox160.go
++++ b/component/tls/firefox160.go
+@@ -23,8 +23,9 @@ import (
+ // an X25519 public key, whose last byte never has the top bit set. The spec
+ // draws the enc itself, per connection.
+ //
+-// "firefox" keeps mihomo's meaning (Firefox 148). Delete when mihomo moves to
+-// a utls release that ships these profiles (then map the names to it).
++// "firefox" means this hello since ReClash core patch 0044, as in Xray;
++// "firefox148" keeps mihomo's old meaning. Delete when mihomo moves to a utls
++// release that ships these profiles (then map the names to it).
+ 
+ var (
+ 	HelloFirefox156 = UClientHelloID{Client: utls.HelloFirefox_148.Client, Version: "156"}
+diff --git a/component/tls/firefox160_test.go b/component/tls/firefox160_test.go
+index 83b1ffc..6de92ad 100644
+--- a/component/tls/firefox160_test.go
++++ b/component/tls/firefox160_test.go
+@@ -136,11 +136,14 @@ func TestFirefox160GreaseECHEncIsUniform(t *testing.T) {
+ 	}
+ }
+ 
+-// "firefox" keeps mihomo's meaning (Firefox 148): the patch only adds names.
+-func TestFirefoxStaysVanilla(t *testing.T) {
+-	id, ok := GetFingerprint("firefox")
+-	if !ok || id == HelloFirefox156 || id == HelloFirefox160 {
+-		t.Fatalf("firefox is %v", id)
++// ReClash core patch 0044: "firefox" is now Firefox 160, as in Xray; the old
++// mihomo parrot stays available as firefox148.
++func TestFirefoxDefaultsAndOldAlias(t *testing.T) {
++	if id, ok := GetFingerprint("firefox"); !ok || id != HelloFirefox160 {
++		t.Fatalf("firefox is %v, want HelloFirefox160", id)
++	}
++	if id, ok := GetFingerprint("firefox148"); !ok || id != utls.HelloFirefox_Auto {
++		t.Fatalf("firefox148 is %v, want utls.HelloFirefox_Auto", id)
+ 	}
+ 	for _, id := range []UClientHelloID{HelloFirefox156, HelloFirefox160} {
+ 		if !FingerprintSupportsX25519MLKEM768(id) {
+diff --git a/component/tls/reality.go b/component/tls/reality.go
+index 841906a..cacd463 100644
+--- a/component/tls/reality.go
++++ b/component/tls/reality.go
+@@ -317,9 +317,9 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
+ 			// The whole ID is compared (core patch 0027): chrome120 and the
+ 			// other old chrome parrots share the Client name with chrome but
+ 			// have no hybrid share.
+-			if fingerprint != utls.HelloChrome_Auto {
++			if fingerprint != HelloChrome155 {
+ 				log.Debugln("REALITY %v: %s fingerprint has no X25519MLKEM768 share, using chrome", conn.RemoteAddr(), fingerprint.Client)
+-				fingerprint = utls.HelloChrome_Auto
++				fingerprint = HelloChrome155
+ 				pqHello = nil
+ 				continue
+ 			}
+diff --git a/component/tls/reality_mlkem_outcome_test.go b/component/tls/reality_mlkem_outcome_test.go
+index e9f1ef1..2b35c82 100644
+--- a/component/tls/reality_mlkem_outcome_test.go
++++ b/component/tls/reality_mlkem_outcome_test.go
+@@ -482,10 +482,10 @@ func TestOutcomeRealityMLKEMMemoIgnoresSilentServer(t *testing.T) {
+ // A learned "needs ML-KEM" verdict must reach the wire. The first attempt is
+ // classic and is refused by a plain TLS site (what Xray >= 26.9.8 does with a
+ // classic hello: it hands it to the target). chrome and chrome155 keep their own
+-// hello, firefox and safari switch to their post-quantum hello (core patch
+-// 0023); a fingerprint without either (edge, ios, the ios that "random" may
+-// pick, and chrome120, which shares the Client name with chrome) borrows
+-// chrome's, the only one that can pass such a server.
++// Chrome 155 hello, firefox and safari switch to their post-quantum hello
++// (core patch 0023), and a fingerprint without either (edge, ios, the ios that
++// "random" may pick, and chrome120, which shares the Client name with chrome)
++// borrows chrome's Chrome 155 hello (core patch 0044).
+ func TestOutcomeRealityMLKEMMemoReachesClientHello(t *testing.T) {
+ 	for _, name := range []string{"chrome", "chrome155", "firefox", "safari", "edge", "ios", "chrome120"} {
+ 		t.Run(name, func(t *testing.T) {
+@@ -511,8 +511,9 @@ func TestOutcomeRealityMLKEMMemoReachesClientHello(t *testing.T) {
+ 				t.Fatalf("second ClientHello lacks X25519MLKEM768 before X25519: %v", keyShareGroups(hello))
+ 			}
+ 			_, chrome155 := parseClientHello(t, hello.Raw).extensions[extensionTrustAnchors]
+-			if chrome155 != (name == "chrome155") {
+-				t.Fatalf("second ClientHello is Chrome 155 = %v", chrome155)
++			wantChrome155 := name == "chrome" || name == "chrome155" || name == "edge" || name == "ios" || name == "chrome120"
++			if chrome155 != wantChrome155 {
++				t.Fatalf("second ClientHello is Chrome 155 = %v, want %v", chrome155, wantChrome155)
+ 			}
+ 		})
+ 	}
+diff --git a/component/tls/reality_pq_specs.go b/component/tls/reality_pq_specs.go
+index ab9d2b7..f6a5140 100644
+--- a/component/tls/reality_pq_specs.go
++++ b/component/tls/reality_pq_specs.go
+@@ -29,7 +29,7 @@ type realityPQHello struct {
+ func realityPQHelloFor(fingerprint UClientHelloID) (realityPQHello, bool) {
+ 	switch fingerprint.Client {
+ 	case utls.HelloFirefox_Auto.Client:
+-		return realityPQHello{name: "Firefox 148", id: utls.HelloFirefox_148}, true
++		return realityPQHello{name: "Firefox 160", id: HelloFirefox160}, true
+ 	case utls.HelloSafari_Auto.Client:
+ 		return realityPQHello{name: "Safari 26.3", id: utls.HelloSafari_26_3}, true
+ 	}
+@@ -38,7 +38,7 @@ func realityPQHelloFor(fingerprint UClientHelloID) (realityPQHello, bool) {
+ 
+ // realityPQConn builds the handshake state from a post-quantum hello.
+ func realityPQConn(conn net.Conn, config *utls.Config, hello realityPQHello) (*utls.UConn, error) {
+-	uConn := utls.UClient(conn, config, hello.id)
++	uConn := uClient(conn, config, hello.id)
+ 	if err := uConn.BuildHandshakeState(); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/component/tls/reality_pq_specs_test.go b/component/tls/reality_pq_specs_test.go
+index f232f5d..a2883de 100644
+--- a/component/tls/reality_pq_specs_test.go
++++ b/component/tls/reality_pq_specs_test.go
+@@ -122,8 +122,8 @@ func TestRealityPQHelloFromOldParrot(t *testing.T) {
+ 	// A pinned pre-quantum parrot of the family has no hybrid share; the hello it
+ 	// switches to does (and is the one "firefox" / "safari" send themselves).
+ 	for _, c := range []struct{ old, current UClientHelloID }{
+-		{utls.HelloFirefox_120, utls.HelloFirefox_Auto},
+-		{utls.HelloFirefox_105, utls.HelloFirefox_Auto},
++		{utls.HelloFirefox_120, HelloFirefox160},
++		{utls.HelloFirefox_105, HelloFirefox160},
+ 		{utls.HelloSafari_16_0, utls.HelloSafari_Auto},
+ 	} {
+ 		c1, c2 := net.Pipe()
+diff --git a/component/tls/utls.go b/component/tls/utls.go
+index ffc7d79..da3b5d9 100644
+--- a/component/tls/utls.go
++++ b/component/tls/utls.go
+@@ -79,8 +79,10 @@ var randomFingerprint = once.OnceValue(func() UClientHelloID {
+ })
+ 
+ var fingerprints = map[string]UClientHelloID{
+-	"chrome":  utls.HelloChrome_Auto,
+-	"firefox": utls.HelloFirefox_Auto,
++	// ReClash core patch 0044: "chrome" and "firefox" follow Xray's current
++	// defaults (Chrome 155, Firefox 160), not mihomo's older Auto parrots.
++	"chrome":  HelloChrome155,
++	"firefox": HelloFirefox160,
+ 	"safari":  utls.HelloSafari_Auto,
+ 	"ios":     utls.HelloIOS_Auto,
+ 	"android": utls.HelloAndroid_11_OkHttp,
+@@ -93,7 +95,9 @@ var fingerprints = map[string]UClientHelloID{
+ 	"chrome133": utls.HelloChrome_133,
+ 	"chrome155": HelloChrome155,
+ 
+-	// pinned Firefox versions, ClashFest core patch 0043
++	// pinned Firefox versions, ClashFest core patch 0043; firefox148 is the
++	// pre-0044 "firefox" meaning
++	"firefox148": utls.HelloFirefox_Auto,
+ 	"firefox156": HelloFirefox156,
+ 	"firefox160": HelloFirefox160,
+ 
+diff --git a/component/tls/utls_xray_names.go b/component/tls/utls_xray_names.go
+index 712d665..abe2aa7 100644
+--- a/component/tls/utls_xray_names.go
++++ b/component/tls/utls_xray_names.go
+@@ -31,7 +31,7 @@ var xrayFingerprints = map[string]UClientHelloID{
+ 	"hellorandomized":                  utls.HelloRandomized,
+ 	"hellorandomizedalpn":              utls.HelloRandomizedALPN,
+ 	"hellorandomizednoalpn":            utls.HelloRandomizedNoALPN,
+-	"hellofirefox_auto":                utls.HelloFirefox_Auto,
++	"hellofirefox_auto":                HelloFirefox160, // current Xray default (0044)
+ 	"hellofirefox_55":                  utls.HelloFirefox_55,
+ 	"hellofirefox_56":                  utls.HelloFirefox_56,
+ 	"hellofirefox_63":                  utls.HelloFirefox_63,
+@@ -39,7 +39,7 @@ var xrayFingerprints = map[string]UClientHelloID{
+ 	"hellofirefox_99":                  utls.HelloFirefox_99,
+ 	"hellofirefox_102":                 utls.HelloFirefox_102,
+ 	"hellofirefox_105":                 utls.HelloFirefox_105,
+-	"hellochrome_auto":                 utls.HelloChrome_Auto,
++	"hellochrome_auto":                 HelloChrome155, // current Xray default (0044)
+ 	"hellochrome_58":                   utls.HelloChrome_58,
+ 	"hellochrome_62":                   utls.HelloChrome_62,
+ 	"hellochrome_70":                   utls.HelloChrome_70,

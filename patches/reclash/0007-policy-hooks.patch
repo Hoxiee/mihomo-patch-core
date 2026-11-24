@@ -1,0 +1,55 @@
+mihomo-patch-core: reclash/0007-policy-hooks
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/constant/metadata.go b/constant/metadata.go
+index 76d1e0e..0eedc50 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -188,6 +188,9 @@ func (t Type) MarshalJSON() ([]byte, error) {
+ 
+ // Metadata is used to store connection address
+ type Metadata struct {
++	PolicyGeneration uint64 `json:"-"`
++	PolicyGlobal     bool   `json:"-"`
++
+ 	NetWork      NetWork    `json:"network"`
+ 	Type         Type       `json:"type"`
+ 	SrcIP        netip.Addr `json:"sourceIP"`
+diff --git a/tunnel/patch.go b/tunnel/patch.go
+index d3ae861..99b9d9d 100644
+--- a/tunnel/patch.go
++++ b/tunnel/patch.go
+@@ -121,3 +121,6 @@ func ResolveRoute(metadata *C.Metadata) (C.Proxy, error) {
+ 	proxy, _, err := resolveMetadata(metadata)
+ 	return proxy, err
+ }
++
++var MetadataPolicyHook func(metadata *C.Metadata) error
++var ModeChangeHook func(mode TunnelMode)
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 684c25b..07608d4 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -257,6 +257,9 @@ func Mode() TunnelMode {
+ 
+ // SetMode change the mode of tunnel
+ func SetMode(m TunnelMode) {
++	if mode != m && ModeChangeHook != nil {
++		ModeChangeHook(m)
++	}
+ 	mode = m
+ }
+ 
+@@ -318,6 +321,12 @@ func preHandleMetadata(metadata *C.Metadata) error {
+ }
+ 
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
++	metadata.PolicyGlobal = metadata.PolicyGlobal || mode == Global
++	if MetadataPolicyHook != nil {
++		if err := MetadataPolicyHook(metadata); err != nil {
++			return nil, nil, err
++		}
++	}
+ 	if metadata.SpecialProxy != "" {
+ 		var exist bool
+ 		proxy, exist = proxies[metadata.SpecialProxy]

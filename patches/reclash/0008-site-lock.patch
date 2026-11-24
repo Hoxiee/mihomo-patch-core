@@ -1,0 +1,69 @@
+mihomo-patch-core: reclash/0008-site-lock
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/tunnel/patch.go b/tunnel/patch.go
+index 99b9d9d..4d6c9b0 100644
+--- a/tunnel/patch.go
++++ b/tunnel/patch.go
+@@ -1,6 +1,7 @@
+ package tunnel
+ 
+ import (
++	"fmt"
+ 	"sync"
+ 
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -124,3 +125,17 @@ func ResolveRoute(metadata *C.Metadata) (C.Proxy, error) {
+ 
+ var MetadataPolicyHook func(metadata *C.Metadata) error
+ var ModeChangeHook func(mode TunnelMode)
++
++// SiteLockHook lets the host claim a connection before the mode, any rule or
++// a listener's own proxy is consulted: a non-nil proxy is used as is, and rule
++// names the claim. Only the inner listener's connections skip it. It runs
++// outside the config lock, may use helper's lazy lookups, and must not block
++// beyond them.
++var SiteLockHook func(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule)
++
++func specialProxy(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
++	if proxy, ok := proxies[metadata.SpecialProxy]; ok {
++		return proxy, nil, nil
++	}
++	return nil, nil, fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
++}
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 07608d4..dd6d44b 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -327,13 +327,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 			return nil, nil, err
+ 		}
+ 	}
+-	if metadata.SpecialProxy != "" {
+-		var exist bool
+-		proxy, exist = proxies[metadata.SpecialProxy]
+-		if !exist {
+-			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+-		}
+-		return
++	if metadata.SpecialProxy != "" && (SiteLockHook == nil || metadata.Type == C.INNER) {
++		return specialProxy(metadata)
+ 	}
+ 	var (
+ 		resolved             bool
+@@ -410,6 +405,15 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 		helper.FindProcess = nil
+ 	}
+ 
++	if SiteLockHook != nil {
++		if locked, claim := SiteLockHook(metadata, helper); locked != nil {
++			return locked, claim, nil
++		}
++	}
++	if metadata.SpecialProxy != "" {
++		return specialProxy(metadata)
++	}
++
+ 	switch mode {
+ 	case Direct:
+ 		proxy = proxies["DIRECT"]

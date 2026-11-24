@@ -1,0 +1,393 @@
+mihomo-patch-core: xray/0045-share-link-xray-params
+Source: Prizrak-Core v1.19.34-r4 common/convert/xray_params.go (GPL-3.0), adapted to the ClashFest finalmask port.
+
+diff --git a/common/convert/converter.go b/common/convert/converter.go
+index 0bccba6..7b6357c 100644
+--- a/common/convert/converter.go
++++ b/common/convert/converter.go
+@@ -166,10 +166,8 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
+ 
+ 			query := urlTrojan.Query()
+ 
+-			name := uniqueName(names, urlTrojan.Fragment)
+ 			trojan := make(map[string]any, 20)
+-
+-			trojan["name"] = name
++			applyName(trojan, names, urlTrojan.Fragment)
+ 			trojan["type"] = scheme
+ 			trojan["server"] = urlTrojan.Hostname()
+ 			trojan["port"] = urlTrojan.Port()
+@@ -220,6 +218,10 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
+ 			if pcs := query.Get("pcs"); pcs != "" {
+ 				trojan["fingerprint"] = pcs
+ 			}
++			if vcn := query.Get("vcn"); vcn != "" {
++				trojan["name-cert-verify"] = vcn
++			}
++			applyFinalMask(trojan, query)
+ 
+ 			proxies = append(proxies, trojan)
+ 
+diff --git a/common/convert/fragment_test.go b/common/convert/fragment_test.go
+index ee3e7f8..2d7e490 100644
+--- a/common/convert/fragment_test.go
++++ b/common/convert/fragment_test.go
+@@ -1,6 +1,7 @@
+ package convert
+ 
+-// ClashFest core patch 0033 tests, from Rerowros/veles (GPL-3.0).
++// ClashFest core patch 0033 test, adapted by ReClash core patch 0045: the
++// share-link fm is now carried as the full finalmask block, not fragment-opts.
+ 
+ import (
+ 	"net/url"
+@@ -9,26 +10,28 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+-func TestConvertsVlessFinalMaskFragment(t *testing.T) {
++func TestConvertsVlessFinalMaskBlock(t *testing.T) {
+ 	fm := `{"tcp":[{"type":"header-custom","settings":{}},{"type":"fragment","settings":{"packets":"tlshello","length":"10-20","delay":0,"maxSplit":"5-9"}}]}`
+ 	link := "vless://11111111-2222-3333-4444-555555555555@example.com:2053?security=reality&pbk=key&sid=ab&sni=example.com&fp=chrome&type=tcp&fm=" + url.QueryEscape(fm) + "#n"
+ 	proxies, err := ConvertsV2Ray([]byte(link))
+ 	require.NoError(t, err)
+ 	require.Len(t, proxies, 1)
+-	require.Equal(t, map[string]any{"packets": "tlshello", "length": "10-20", "delay": "0", "max-split": "5-9"}, proxies[0]["fragment-opts"])
++	block, ok := proxies[0]["finalmask"].(map[string]any)
++	require.True(t, ok, "finalmask missing")
++	require.Len(t, block["tcp"], 2)
++	require.NotContains(t, block, "udp")
++	require.NotContains(t, proxies[0], "fragment-opts")
+ 
+-	for _, fm := range []string{"", "not json", `{"tcp":[{"type":"header-custom"}]}`, `{"udp":[{"type":"fragment"}]}`,
+-		`{"tcp":[{"type":"fragment","settings":{"packets":"abc"}}]}`, `{"tcp":[{"type":"fragment","settings":{"delay":-1}}]}`,
+-		`{"tcp":[{"type":"fragment","settings":{"delay":"0-9223372036854775807"}}]}`} {
++	for _, fm := range []string{"", "not json", `{"quicParams":{}}`} {
+ 		link := "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&fm=" + url.QueryEscape(fm) + "#n"
+ 		proxies, err := ConvertsV2Ray([]byte(link))
+ 		require.NoError(t, err)
+-		require.NotContains(t, proxies[0], "fragment-opts", "fm=%q", fm)
++		require.NotContains(t, proxies[0], "finalmask", "fm=%q", fm)
+ 	}
+ 
+ 	fm = `{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["10-20","30"],"delays":[0]}}]}`
+ 	link = "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&fm=" + url.QueryEscape(fm) + "#n"
+ 	proxies, err = ConvertsV2Ray([]byte(link))
+ 	require.NoError(t, err)
+-	require.Equal(t, map[string]any{"packets": "tlshello", "length": "10-20", "delay": "0"}, proxies[0]["fragment-opts"])
++	require.Len(t, proxies[0]["finalmask"].(map[string]any)["tcp"], 1)
+ }
+diff --git a/common/convert/v.go b/common/convert/v.go
+index e41211e..4cb1f13 100644
+--- a/common/convert/v.go
++++ b/common/convert/v.go
+@@ -7,15 +7,13 @@ import (
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
+-
+-	"github.com/metacubex/mihomo/component/fragment"
+ )
+ 
+ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy map[string]any) error {
+ 	// Xray VMessAEAD / VLESS share link standard
+ 	// https://github.com/XTLS/Xray-core/discussions/716
+ 	query := url.Query()
+-	proxy["name"] = uniqueName(names, url.Fragment)
++	applyName(proxy, names, url.Fragment)
+ 	if url.Hostname() == "" {
+ 		return errors.New("url.Hostname() is empty")
+ 	}
+@@ -41,6 +39,9 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
+ 		if pcs := query.Get("pcs"); pcs != "" {
+ 			proxy["fingerprint"] = pcs
+ 		}
++		if vcn := query.Get("vcn"); vcn != "" {
++			proxy["name-cert-verify"] = vcn
++		}
+ 	}
+ 	if sni := query.Get("sni"); sni != "" {
+ 		proxy["servername"] = sni
+@@ -55,13 +56,11 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
+ 				realityOpts["support-x25519mlkem768"] = enabled
+ 			}
+ 		}
++		if pqv := query.Get("pqv"); pqv != "" {
++			realityOpts["mldsa65-verify"] = pqv
++		}
+ 		proxy["reality-opts"] = realityOpts
+ 	}
+-	// ClashFest core patch 0033: Xray finalmask TCP "fragment" from the fm parameter
+-	if fragmentOpts := fragmentOptsFromFinalMask(query.Get("fm")); fragmentOpts != nil {
+-		proxy["fragment-opts"] = fragmentOpts
+-	}
+-
+ 	switch query.Get("packetEncoding") {
+ 	case "none":
+ 	case "packet":
+@@ -175,6 +174,9 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
+ 		proxy["xhttp-opts"] = xhttpOpts
+ 	}
+ 
++	if scheme == "vless" {
++		applyFinalMask(proxy, query)
++	}
+ 	return nil
+ }
+ 
+@@ -432,73 +434,3 @@ func splitHysteria2Ports(line string) (string, string) {
+ 	}
+ 	return head + userinfo + host + ":" + first + tail, ports
+ }
+-
+-// fragmentOptsFromFinalMask maps the first TCP "fragment" mask of an Xray fm
+-// parameter, {"tcp":[{"type":"fragment","settings":{"packets":"tlshello",
+-// "length":"10-20","delay":"0"}}]}, to fragment-opts. Other masks are ignored.
+-func fragmentOptsFromFinalMask(fm string) map[string]any {
+-	if fm == "" {
+-		return nil
+-	}
+-	var finalMask struct {
+-		TCP []struct {
+-			Type     string                     `json:"type"`
+-			Settings map[string]json.RawMessage `json:"settings"`
+-		} `json:"tcp"`
+-	}
+-	if err := json.Unmarshal([]byte(fm), &finalMask); err != nil {
+-		return nil
+-	}
+-	for _, mask := range finalMask.TCP {
+-		if !strings.EqualFold(mask.Type, "fragment") {
+-			continue
+-		}
+-		opts := map[string]any{}
+-		for key, name := range map[string]string{"packets": "packets", "length": "length", "delay": "delay", "maxSplit": "max-split"} {
+-			raw, ok := mask.Settings[key]
+-			if !ok {
+-				continue
+-			}
+-			var value any
+-			if err := json.Unmarshal(raw, &value); err != nil {
+-				continue
+-			}
+-			switch v := value.(type) {
+-			case string:
+-				opts[name] = v
+-			case float64:
+-				opts[name] = strconv.FormatInt(int64(v), 10)
+-			}
+-		}
+-		// per-piece lists are not supported: take their first entry
+-		for key, name := range map[string]string{"lengths": "length", "delays": "delay"} {
+-			var list []json.RawMessage
+-			if _, ok := opts[name]; ok || json.Unmarshal(mask.Settings[key], &list) != nil || len(list) == 0 {
+-				continue
+-			}
+-			var value any
+-			if json.Unmarshal(list[0], &value) == nil {
+-				switch v := value.(type) {
+-				case string:
+-					opts[name] = v
+-				case float64:
+-					opts[name] = strconv.FormatInt(int64(v), 10)
+-				}
+-			}
+-		}
+-		if len(opts) == 0 {
+-			opts["packets"] = "tlshello"
+-		}
+-		// one bad link must not fail the whole subscription
+-		check := fragment.Options{}
+-		check.Packets, _ = opts["packets"].(string)
+-		check.Length, _ = opts["length"].(string)
+-		check.Delay, _ = opts["delay"].(string)
+-		check.MaxSplit, _ = opts["max-split"].(string)
+-		if _, err := check.Parse(); err != nil {
+-			return nil
+-		}
+-		return opts
+-	}
+-	return nil
+-}
+diff --git a/common/convert/xray_params.go b/common/convert/xray_params.go
+new file mode 100644
+index 0000000..9dc4789
+--- /dev/null
++++ b/common/convert/xray_params.go
+@@ -0,0 +1,96 @@
++package convert
++
++// ReClash core patch 0045: the Xray share-link parameters ClashFest 0033 left
++// out. `pqv` is Xray's mldsa65Verify, `vcn` its name-cert-verify, `fm` is the
++// full finalmask block (0033 carried only the fragment mask), and Remnawave
++// appends the server description as ?serverDescription= after the remark.
++// Ported from Prizrak-Core v1.19.34-r4 common/convert/xray_params.go (GPL-3.0).
++
++import (
++	"encoding/json"
++	"net/url"
++	"strings"
++	"unicode/utf8"
++
++	"github.com/metacubex/mihomo/log"
++)
++
++const serverDescriptionTail = "?serverDescription="
++
++// splitServerDescription takes the Happ server description off a link's
++// fragment: Remnawave appends ?serverDescription=<base64> after the remark.
++func splitServerDescription(fragment string) (name, description string) {
++	i := strings.LastIndex(fragment, serverDescriptionTail)
++	if i < 0 {
++		return fragment, ""
++	}
++	name, raw := fragment[:i], fragment[i+len(serverDescriptionTail):]
++	if raw == "" {
++		return name, ""
++	}
++	if decoded, err := TryDecodeBase64(raw); err == nil && utf8.Valid(decoded) {
++		return name, string(decoded)
++	}
++	return name, raw
++}
++
++// applyName sets the proxy's unique name from the link's fragment and keeps
++// the server description beside it as serverDescription, the key ReClash reads.
++func applyName(proxy map[string]any, names map[string]int, fragment string) {
++	name, description := splitServerDescription(fragment)
++	proxy["name"] = uniqueName(names, name)
++	if description != "" {
++		proxy["serverDescription"] = description
++	}
++}
++
++// finalMaskBlock keeps the tcp and udp chains of an Xray finalmask object, nil
++// when it has none. The entries stay as Xray writes them (settings nested,
++// camelCase keys); the finalmask option package reads that form.
++func finalMaskBlock(fm map[string]any, proxy map[string]any) map[string]any {
++	if proxy["network"] == "xdrive" {
++		// xdrive goes to a storage service; finalmask cannot wrap it.
++		return nil
++	}
++	block := make(map[string]any, 2)
++	if list, ok := fm["tcp"].([]any); ok && len(list) > 0 {
++		block["tcp"] = list
++	}
++	if list, ok := fm["udp"].([]any); ok && len(list) > 0 {
++		if finalMaskUDPUsable(proxy) {
++			block["udp"] = list
++		} else {
++			log.Debugln("finalmask.udp of %v dropped: it is used by vless over xhttp with alpn h3 only", proxy["name"])
++		}
++	}
++	if len(block) == 0 {
++		return nil
++	}
++	return block
++}
++
++func finalMaskUDPUsable(proxy map[string]any) bool {
++	if proxy["type"] != "vless" || proxy["network"] != "xhttp" {
++		return false
++	}
++	alpn, _ := proxy["alpn"].([]string)
++	return len(alpn) == 1 && alpn[0] == "h3"
++}
++
++// applyFinalMask carries fm=<JSON> of a vless or trojan link into the proxy's
++// finalmask block. A link whose fm is not valid JSON keeps the proxy without
++// masks, as Xray drops the unusable option.
++func applyFinalMask(proxy map[string]any, query url.Values) {
++	raw := query.Get("fm")
++	if raw == "" {
++		return
++	}
++	var fm map[string]any
++	if err := json.Unmarshal([]byte(raw), &fm); err != nil {
++		log.Warnln("finalmask of %v is not valid JSON, dropped: %s", proxy["name"], err)
++		return
++	}
++	if block := finalMaskBlock(fm, proxy); block != nil {
++		proxy["finalmask"] = block
++	}
++}
+diff --git a/common/convert/xray_params_test.go b/common/convert/xray_params_test.go
+new file mode 100644
+index 0000000..b6e3a15
+--- /dev/null
++++ b/common/convert/xray_params_test.go
+@@ -0,0 +1,74 @@
++package convert_test
++
++import (
++	"encoding/base64"
++	"net/url"
++	"testing"
++
++	"github.com/metacubex/mihomo/adapter"
++	. "github.com/metacubex/mihomo/common/convert"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const remnawaveFM = `{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["1-1"],"delays":["0"]}},{"type":"header-custom","settings":{"clients":[[{"type":"str","packet":"GET / HTTP/1.1\r\nX-N: "},{"rand":8,"randRange":"97-122","capture":"n"},{"type":"str","packet":"\r\n\r\n"}]],"servers":[[{"reuse":"n"}]]}}],"udp":[{"type":"noise","settings":{"noise":[{"rand":"10-20","randRange":"0-255"}]}},{"type":"udphop","settings":{"mode":"intervalLocal","interval":"10-20","remotePorts":["443","20000-30000"]}}]}`
++
++// A vless link as the Remnawave backend writes it: fm with the full Xray
++// finalmask, pqv, vcn, and the server description after the remark.
++func TestConvertsV2RayRemnawaveVless(t *testing.T) {
++	description := base64.StdEncoding.EncodeToString([]byte("Игры, YouTube"))
++	pqv := base64.RawURLEncoding.EncodeToString(make([]byte, 1952)) // an ML-DSA-65 key is 1952 bytes
++	link := "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=example.com&fp=chrome&pbk=ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw&sid=6ba85179&pqv=" + pqv + "&vcn=real.example.com&spx=%2F&fm=" + url.QueryEscape(remnawaveFM) + "#" + url.PathEscape("Эстония 🇪🇪") + "?serverDescription=" + description
++
++	for _, input := range []string{link, base64.StdEncoding.EncodeToString([]byte(link + "\n"))} {
++		proxies, err := ConvertsV2Ray([]byte(input))
++		require.NoError(t, err)
++		require.Len(t, proxies, 1)
++		p := proxies[0]
++		assert.Equal(t, "Эстония 🇪🇪", p["name"])
++		assert.Equal(t, "Игры, YouTube", p["serverDescription"])
++		assert.Equal(t, "real.example.com", p["name-cert-verify"])
++		assert.Equal(t, map[string]any{"public-key": "ppQ9FwLrLIa0AOrp1WvcyiaQ37vg2WSy_CD4bIdiTUw", "short-id": "6ba85179", "mldsa65-verify": pqv}, p["reality-opts"])
++		fm, ok := p["finalmask"].(map[string]any)
++		require.True(t, ok, "finalmask missing")
++		assert.Len(t, fm["tcp"], 2)
++		// udp masks are for xhttp over h3 only; a tcp proxy drops them.
++		assert.NotContains(t, fm, "udp")
++
++		proxy, err := adapter.ParseProxy(p)
++		require.NoError(t, err)
++		assert.Equal(t, "Эстония 🇪🇪", proxy.Name())
++	}
++}
++
++func TestConvertsV2RayVlessXHTTPH3KeepsUDPMasks(t *testing.T) {
++	link := "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption=none&type=xhttp&path=%2Fx&mode=packet-up&security=tls&sni=example.com&alpn=h3&fm=" + url.QueryEscape(remnawaveFM) + "#h3"
++	proxies, err := ConvertsV2Ray([]byte(link))
++	require.NoError(t, err)
++	fm := proxies[0]["finalmask"].(map[string]any)
++	assert.Len(t, fm["tcp"], 2)
++	assert.Len(t, fm["udp"], 2)
++	_, err = adapter.ParseProxy(proxies[0])
++	require.NoError(t, err)
++}
++
++func TestConvertsV2RayTrojanRemnawave(t *testing.T) {
++	link := "trojan://pass%40word@example.com:443?type=tcp&security=tls&sni=example.com&fp=chrome&vcn=real.example.com&fm=" + url.QueryEscape(`{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","length":"1-1","delay":"0"}}]}`) + "#Trojan?serverDescription=" + base64.RawURLEncoding.EncodeToString([]byte("plain text"))
++	proxies, err := ConvertsV2Ray([]byte(link))
++	require.NoError(t, err)
++	p := proxies[0]
++	assert.Equal(t, "Trojan", p["name"])
++	assert.Equal(t, "plain text", p["serverDescription"])
++	assert.Equal(t, "real.example.com", p["name-cert-verify"])
++	assert.Len(t, p["finalmask"].(map[string]any)["tcp"], 1)
++	_, err = adapter.ParseProxy(p)
++	require.NoError(t, err)
++}
++
++func TestConvertsV2RayInvalidFMKeepsProxy(t *testing.T) {
++	proxies, err := ConvertsV2Ray([]byte("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=tcp&security=none&fm=%7Bnot-json#bad"))
++	require.NoError(t, err)
++	require.Len(t, proxies, 1)
++	assert.NotContains(t, proxies[0], "finalmask")
++}

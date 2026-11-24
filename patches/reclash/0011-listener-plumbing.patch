@@ -1,0 +1,40 @@
+mihomo-patch-core: reclash/0011-listener-plumbing
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/listener/patch.go b/listener/patch.go
+index 6ab5aa1..f500ea3 100644
+--- a/listener/patch.go
++++ b/listener/patch.go
+@@ -57,11 +57,6 @@ func StopListener() {
+ 		shadowSocksListener = nil
+ 	}
+ 
+-	if shadowSocksListener != nil {
+-		_ = shadowSocksListener.Close()
+-		shadowSocksListener = nil
+-	}
+-
+ 	if vmessListener != nil {
+ 		_ = vmessListener.Close()
+ 		vmessListener = nil
+diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
+index 3373a46..9b5d5c4 100644
+--- a/listener/sing_tun/server.go
++++ b/listener/sing_tun/server.go
+@@ -38,6 +38,7 @@ import (
+ 
+ var InterfaceName = "Meta"
+ var EnforceBindInterface = false
++var NewStack = tun.NewStack
+ 
+ type Listener struct {
+ 	closed  bool
+@@ -503,7 +504,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
+ 	}
+ 	l.tunIf = tunIf
+ 
+-	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
++	tunStack, err := NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+ 	if err != nil {
+ 		return
+ 	}

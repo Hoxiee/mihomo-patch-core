@@ -1,0 +1,72 @@
+mihomo-patch-core: reclash/0001-external-adapter-registry
+Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
+
+diff --git a/adapter/outbound/external.go b/adapter/outbound/external.go
+new file mode 100644
+index 0000000..98e4f53
+--- /dev/null
++++ b/adapter/outbound/external.go
+@@ -0,0 +1,25 @@
++package outbound
++
++import "sync"
++
++// ExternalFactory builds an adapter for a proxy type registered by the embedding application.
++type ExternalFactory func(mapping map[string]any, basic BasicOption) (ProxyAdapter, error)
++
++var (
++	externalMu        sync.RWMutex
++	externalFactories = map[string]ExternalFactory{}
++)
++
++// RegisterExternal adds a proxy type the built-in parser does not know. Built-in types always win.
++func RegisterExternal(name string, factory ExternalFactory) {
++	externalMu.Lock()
++	defer externalMu.Unlock()
++	externalFactories[name] = factory
++}
++
++func LookupExternal(name string) (ExternalFactory, bool) {
++	externalMu.RLock()
++	defer externalMu.RUnlock()
++	factory, ok := externalFactories[name]
++	return factory, ok
++}
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 68bccdb..0d8875f 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -224,7 +224,11 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 		}
+ 		proxy, err = outbound.NewEasyTier(*easyTierOption)
+ 	default:
+-		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
++		factory, ok := outbound.LookupExternal(proxyType)
++		if !ok {
++			return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
++		}
++		proxy, err = factory(mapping, basicOption)
+ 	}
+ 
+ 	if err != nil {
+diff --git a/constant/adapters.go b/constant/adapters.go
+index ffb1f2a..5b3c2c2 100644
+--- a/constant/adapters.go
++++ b/constant/adapters.go
+@@ -55,6 +55,7 @@ const (
+ 	ZeroTier
+ 	EasyTier
+ 	GostRelay
++	Extension
+ )
+ 
+ const (
+@@ -243,6 +244,8 @@ func (at AdapterType) String() string {
+ 		return "EasyTier"
+ 	case GostRelay:
+ 		return "GostRelay"
++	case Extension:
++		return "Extension"
+ 	case Relay:
+ 		return "Relay"
+ 	case Selector:

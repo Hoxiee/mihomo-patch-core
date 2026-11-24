@@ -1,8 +1,11 @@
 ./component/tls/
 ./component/ca/
 ./component/sniffer/
+./component/updater/
+./common/convert/
 ./dns/
 ./tunnel/
+./tunnel/statistic/
 ./transport/finalmask/...
 ./transport/xdrive/
 ./transport/muxcool/
@@ -11,5 +14,8 @@
 ./adapter/
 ./adapter/outbound/
 ./adapter/outboundgroup/
+./adapter/provider/
 ./config/
 ./hub/route/
+./listener/
+./listener/sing_tun/
