@@ -1,4 +1,4 @@
-mihomo-patch-core: diagnostics/0003-proxy-transfer-export
+rain-core: diagnostics/0003-proxy-transfer-export
 Source: ClashFest core patch 0025 (GPL-3.0).
 
 diff --git a/hub/route/proxy_transfer_export.go b/hub/route/proxy_transfer_export.go

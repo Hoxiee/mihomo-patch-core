@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0020-trusttunnel-quic
+rain-core: reclash/0020-trusttunnel-quic
 Source: ReClash review (2026-11-25); keep TrustTunnel's bool quic option.
 
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go

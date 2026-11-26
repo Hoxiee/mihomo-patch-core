@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0011-quic-disable-mtu-discovery
+rain-core: xray/0011-quic-disable-mtu-discovery
 Source: ClashFest core patch 0011 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go

@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0005-flow-evidence
+rain-core: reclash/0005-flow-evidence
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/tunnel/evidence.go b/tunnel/evidence.go

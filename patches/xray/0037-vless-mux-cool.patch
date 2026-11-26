@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0037-vless-mux-cool
+rain-core: xray/0037-vless-mux-cool
 Source: ClashFest core patch 0037 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0037: VLESS mux.cool client (opt-in "mux.cool" block on vless proxies).

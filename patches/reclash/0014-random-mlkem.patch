@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0014-random-mlkem
+rain-core: reclash/0014-random-mlkem
 Source: Prizrak-Core a44096ba and a9e5c456 (GPL-3.0); randomized hello and random fingerprint fixes.
 
 diff --git a/component/tls/chrome155.go b/component/tls/chrome155.go

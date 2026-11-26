@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0009-direct-split
+rain-core: reclash/0009-direct-split
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/tunnel/patch.go b/tunnel/patch.go

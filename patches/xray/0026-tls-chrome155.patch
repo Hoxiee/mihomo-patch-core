@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0026-tls-chrome155
+rain-core: xray/0026-tls-chrome155
 Source: ClashFest core patch 0026 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/chrome155.go b/component/tls/chrome155.go

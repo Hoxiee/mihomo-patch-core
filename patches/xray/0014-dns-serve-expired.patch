@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0014-dns-serve-expired
+rain-core: xray/0014-dns-serve-expired
 Source: ClashFest core patch 0014 (GPL-3.0), ported to the core series.
 
 diff --git a/config/config.go b/config/config.go

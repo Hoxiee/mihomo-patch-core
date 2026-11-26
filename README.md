@@ -1,8 +1,10 @@
-# mihomo-patch-core
+# Rain Core
 
-A patch series that turns a clean [mihomo](https://github.com/MetaCubeX/mihomo) checkout into the
-proxy core ReClash runs. The upstream tree stays unmodified; every behaviour is a numbered,
-reviewable patch that can be rebased or deleted on its own.
+The official mihomo core of [ReClash](https://github.com/Hoxiee/ReClash): a patch series that turns
+a clean [mihomo](https://github.com/MetaCubeX/mihomo) checkout into the proxy engine the
+application ships. It is built for ReClash and usable by any mihomo host through its `core`
+profile; the upstream tree stays unmodified and every behaviour is a numbered, reviewable patch
+that can be rebased or deleted on its own.
 
 The dependency direction is explicit:
 

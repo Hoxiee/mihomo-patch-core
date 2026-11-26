@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0021-ping-loop-safety
+rain-core: reclash/0021-ping-loop-safety
 Source: ReClash review (2026-11-25); fix health-check scheduling hazards.
 
 diff --git a/adapter/provider/healthcheck.go b/adapter/provider/healthcheck.go

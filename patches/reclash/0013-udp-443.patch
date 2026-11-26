@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0013-udp-443
+rain-core: reclash/0013-udp-443
 Source: Prizrak-Core 8076d9ae (GPL-3.0); udp-443 / quic REJECT option.
 
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go

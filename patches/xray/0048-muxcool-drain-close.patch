@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0048-muxcool-drain-close
+rain-core: xray/0048-muxcool-drain-close
 Source: ReClash fix on top of xray/0037 (GPL-3.0), kept apart from the ported code.
 
 A carrier that reached its lifetime is draining. Closing it hands the cause to

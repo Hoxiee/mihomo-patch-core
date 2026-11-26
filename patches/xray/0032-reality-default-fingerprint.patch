@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0032-reality-default-fingerprint
+rain-core: xray/0032-reality-default-fingerprint
 Source: ClashFest core patch 0032 (GPL-3.0), ported to the core series.
 
 diff --git a/transport/vmess/tls.go b/transport/vmess/tls.go

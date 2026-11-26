@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply, revert, and inspect a mihomo-patch-core profile.
+# Apply, revert, and inspect a rain-core profile.
 #
 # Usage:
 #   tool/patch.sh <list|status|check|apply|revert> [target] [--target DIR] [--profile NAME]
@@ -12,7 +12,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 profile=${MIHOMO_PROFILE:-reclash}
 
 die() {
-  printf 'mihomo-patch-core: %s\n' "$*" >&2
+  printf 'rain-core: %s\n' "$*" >&2
   exit 1
 }
 

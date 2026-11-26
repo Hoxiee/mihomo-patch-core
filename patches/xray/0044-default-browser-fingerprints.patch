@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0044-default-browser-fingerprints
+rain-core: xray/0044-default-browser-fingerprints
 Source: ReClash policy over ClashFest core patches 0026/0043 (GPL-3.0).
 
 diff --git a/component/tls/chrome155.go b/component/tls/chrome155.go

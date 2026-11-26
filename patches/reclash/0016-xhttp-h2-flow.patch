@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0016-xhttp-h2-flow
+rain-core: reclash/0016-xhttp-h2-flow
 Source: Prizrak-Core b9be2bdf / 995c1f38 (GPL-3.0); HTTP/2 downlink flow governor for XHTTP.
 
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go

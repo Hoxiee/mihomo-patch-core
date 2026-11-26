@@ -1,4 +1,4 @@
-mihomo-patch-core: diagnostics/0002-proxy-transfer-test
+rain-core: diagnostics/0002-proxy-transfer-test
 Source: ClashFest core patch 0024 (GPL-3.0); the router hunk was adapted because ReClash does not carry the desync routes, and the test helper is local.
 
 diff --git a/hub/route/proxies.go b/hub/route/proxies.go

@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0012-controller-serve-log
+rain-core: reclash/0012-controller-serve-log
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/hub/route/server.go b/hub/route/server.go

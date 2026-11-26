@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0012-tcp-connect-timeout
+rain-core: xray/0012-tcp-connect-timeout
 Source: ClashFest core patch 0012 (GPL-3.0), ported to the core series.
 
 A value outside 100-600000 ms is clamped with a warning rather than failing

@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0040-proxy-options-graceful
+rain-core: xray/0040-proxy-options-graceful
 Source: ClashFest core patch 0040 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0040: unusable proxy options are ignored, not fatal.

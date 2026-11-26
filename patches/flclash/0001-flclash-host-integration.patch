@@ -1,4 +1,4 @@
-mihomo-patch-core: flclash/0001-flclash-host-integration
+rain-core: flclash/0001-flclash-host-integration
 Source: FlClash through Hoxiee/mihomo 797b6757 (GPL-3.0).
 
 diff --git a/adapter/adapter.go b/adapter/adapter.go

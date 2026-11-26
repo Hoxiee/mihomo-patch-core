@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0036-share-link-log-redaction
+rain-core: xray/0036-share-link-log-redaction
 Source: ClashFest core patch 0036 (GPL-3.0), ported to the core series.
 
 diff --git a/common/convert/converter.go b/common/convert/converter.go

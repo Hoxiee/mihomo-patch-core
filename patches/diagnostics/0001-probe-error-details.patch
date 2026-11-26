@@ -1,4 +1,4 @@
-mihomo-patch-core: diagnostics/0001-probe-error-details
+rain-core: diagnostics/0001-probe-error-details
 Source: ClashFest core patch 0016 (GPL-3.0).
 
 diff --git a/hub/route/proxies.go b/hub/route/proxies.go

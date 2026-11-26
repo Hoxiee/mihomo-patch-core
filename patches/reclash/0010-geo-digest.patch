@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0010-geo-digest
+rain-core: reclash/0010-geo-digest
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/component/updater/patch.go b/component/updater/patch.go

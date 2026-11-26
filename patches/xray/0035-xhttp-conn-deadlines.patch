@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0035-xhttp-conn-deadlines
+rain-core: xray/0035-xhttp-conn-deadlines
 Source: ClashFest core patch 0035 (GPL-3.0), ported to the core series.
 
 diff --git a/transport/xhttp/conn.go b/transport/xhttp/conn.go

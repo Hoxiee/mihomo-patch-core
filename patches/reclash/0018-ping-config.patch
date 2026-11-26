@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0018-ping-config
+rain-core: reclash/0018-ping-config
 Source: Prizrak-Core 51359476 (GPL-3.0), without the smart group.
 
 diff --git a/adapter/adapter.go b/adapter/adapter.go

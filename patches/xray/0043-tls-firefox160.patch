@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0043-tls-firefox160
+rain-core: xray/0043-tls-firefox160
 Source: ClashFest core patch 0043 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0043: client-fingerprint firefox156 / firefox160.

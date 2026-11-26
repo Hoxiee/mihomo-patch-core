@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0030-xdrive-muxcool-citrus-fixes
+rain-core: xray/0030-xdrive-muxcool-citrus-fixes
 Source: ClashFest core patch 0030 (GPL-3.0), ported to the core series.
 
 diff --git a/transport/vless/muxcool/client.go b/transport/vless/muxcool/client.go

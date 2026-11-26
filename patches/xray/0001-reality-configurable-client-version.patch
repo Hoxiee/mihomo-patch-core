@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0001-reality-configurable-client-version
+rain-core: xray/0001-reality-configurable-client-version
 Source: ClashFest core patch 0001 (GPL-3.0), ported to the core series.
 
 diff --git a/component/tls/reality.go b/component/tls/reality.go

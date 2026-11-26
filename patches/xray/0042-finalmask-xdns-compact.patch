@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0042-finalmask-xdns-compact
+rain-core: xray/0042-finalmask-xdns-compact
 Source: ClashFest core patch 0042 (GPL-3.0), ported to the core series.
 
 ClashFest core patch 0042: the compact xdns spelling of the first Xray xdns.

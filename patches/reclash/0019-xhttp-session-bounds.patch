@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0019-xhttp-session-bounds
+rain-core: reclash/0019-xhttp-session-bounds
 Source: ReClash review (2026-11-25), hardening Xray-compatible xhttp sessions.
 
 diff --git a/transport/xhttp/config.go b/transport/xhttp/config.go

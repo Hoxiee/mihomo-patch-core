@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0006-reality-mldsa65-verify
+rain-core: xray/0006-reality-mldsa65-verify
 Source: ClashFest core patch 0006 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/reality.go b/adapter/outbound/reality.go

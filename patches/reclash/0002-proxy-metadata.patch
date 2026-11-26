@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0002-proxy-metadata
+rain-core: reclash/0002-proxy-metadata
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/adapter/adapter.go b/adapter/adapter.go

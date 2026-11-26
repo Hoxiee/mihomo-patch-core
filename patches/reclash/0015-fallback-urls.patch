@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0015-fallback-urls
+rain-core: reclash/0015-fallback-urls
 Source: Prizrak-Core 63de05b7 (GPL-3.0); fallback addresses for HTTP proxy and rule providers.
 
 diff --git a/adapter/provider/parser.go b/adapter/provider/parser.go

@@ -1,4 +1,4 @@
-mihomo-patch-core: flclash/0002-finalmask-android-guard
+rain-core: flclash/0002-finalmask-android-guard
 Source: ReClash host adaptation after the FlClash layer; ClashFest 0041 uses features.CMFA in core.
 
 diff --git a/config/finalmask_test.go b/config/finalmask_test.go

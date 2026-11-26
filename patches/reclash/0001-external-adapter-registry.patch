@@ -1,4 +1,4 @@
-mihomo-patch-core: reclash/0001-external-adapter-registry
+rain-core: reclash/0001-external-adapter-registry
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/adapter/outbound/external.go b/adapter/outbound/external.go

@@ -1,4 +1,4 @@
-mihomo-patch-core: xray/0004-reality-per-proxy-client-version
+rain-core: xray/0004-reality-per-proxy-client-version
 Source: ClashFest core patch 0004 (GPL-3.0), ported to the core series.
 
 diff --git a/adapter/outbound/reality.go b/adapter/outbound/reality.go
