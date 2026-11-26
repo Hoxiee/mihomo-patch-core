@@ -105,13 +105,36 @@ tool/xray_interop.sh --target ../ReClash/core/.mihomo   # existing core-profile 
 CI runs the same script in the `interop` job. Without `MIHOMO_XRAY_BIN` the Go test skips with an
 explicit message, so a normal `tool/test.sh` run stays self-contained.
 
+The mux.cool fault suite is part of every run and stays under five seconds.
+`transport/muxcool/fault_carrier_test.go` wraps the carrier in a `net.Conn` that injects latency,
+deterministic jitter, token-bucket bandwidth throttling, temporary write stalls, short writes and a
+partial write failure; its dialer owns the peer side, so a test can produce a clean FIN, a TCP reset
+(`SO_LINGER 0`) or a blackholed peer the way a real peer does. `fault_injection_test.go` runs TCP and
+UDP sessions at 0/20/250 ms delay (plus 20 ms of jitter), a stall past the frame timeout, short and
+partial writes, peer EOF and RST, a server that stops reading, and sibling isolation, and asserts
+bounded errors and no panic. `goroutine_leak_test.go` captures `runtime.NumGoroutine` before and
+after a mixed TCP+UDP workload with carrier rotation and deadline churn, retries with a bound, and
+fails with a `runtime.Stack` dump on growth. No new dependency is required.
+
+The soak is opt-in because it is a wall-clock stress run:
+
+```bash
+MIHOMO_SOAK_SECONDS=30 go test -run TestSoak -timeout 180s ./transport/muxcool/
+MIHOMO_SOAK_SECONDS=30 MIHOMO_SOAK_WORKERS=128 go test -run TestSoak -timeout 180s ./transport/muxcool/
+```
+
+It mixes `MIHOMO_SOAK_WORKERS` sessions (default 128, minimum 100) split between TCP and UDP,
+open/close churn, carrier rotation, consumers that trip `ErrSessionOverflow`, UDP datagram drops and
+periodic carrier kills. Every successful session must echo its payload, every failure must be one of
+the documented errors, and the goroutine count must return to its pre-run baseline.
+
 ## Profiles
 
 | Profile | Patches | Contents |
 |---|---:|---|
-| `core` | 48 | xray 45 + diagnostics 3 |
-| `flclash` | 50 | core + FlClash host 1 + feature.Android adaptation 1 |
-| `reclash` | 71 | flclash + ReClash 21 |
+| `core` | 49 | xray 46 + diagnostics 3 |
+| `flclash` | 51 | core + FlClash host 1 + feature.Android adaptation 1 |
+| `reclash` | 72 | flclash + ReClash 21 |
 
 `core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
 is what the ReClash application consumes.
@@ -131,6 +154,7 @@ deadlock. The hardening patches keep that port as the wire source and fix the tr
 | `0054-muxcool-protocol-hardening` | server-initiated New is ignored; the uncontended write turn avoids a per-frame timer; fuzz targets, protocol edge tests and benchmarks |
 | `0055-muxcool-xray-interop` | real Xray-core interop suite, pinned and run in CI |
 | `0056-muxcool-expired-write-deadline` | an already-expired caller deadline is rejected after taking the write turn without closing the carrier |
+| `0057-muxcool-soak-fault-injection` | fault-injecting carrier (latency, jitter, token bucket, stalls, short/partial writes), deterministic TCP and UDP fault matrix, goroutine-leak check, opt-in soak; fixes a clean-EOF payload drop and a failed carrier still accepting sessions |
 
 ### Compatibility
 

@@ -1,0 +1,1409 @@
+rain-core: xray/0057-muxcool-soak-fault-injection
+Source: ReClash test on top of xray/0049-0056 (GPL-3.0).
+
+The hardening series fixed the mux.cool transport but had no test that could
+produce the failures it fixes on demand: no fault-injecting carrier, no soak,
+and no goroutine check after close. This patch adds that verification layer
+and the two production defects it found.
+
+- The carrier fault harness wraps net.Pipe in a net.Conn that injects
+  latency, deterministic jitter, a token-bucket bandwidth limit, temporary
+  write stalls, short writes, and a partial write failure; the dialer owns
+  the peer side so a test can produce a clean FIN, a TCP reset (SO_LINGER 0)
+  and a blackholed peer the way a real peer does.
+- Fault coverage: TCP and UDP sessions at 0/20/250 ms delay and 20 ms of
+  jitter; a write stalled past the frame timeout; short and partial writes;
+  peer EOF and RST; a server that stops reading; sibling isolation.
+- Goroutine leak detection without a new dependency: runtime.NumGoroutine
+  before and after a mixed TCP+UDP workload with carrier rotation and
+  deadline churn, bounded retry, runtime.Stack dump on growth.
+- Opt-in soak behind MIHOMO_SOAK_SECONDS (MIHOMO_SOAK_WORKERS defaults to
+  128): concurrent TCP and UDP sessions, open/close churn, rotation,
+  ErrSessionOverflow, UDP drops and periodic carrier kills.
+
+Two defects found and fixed:
+
+1. A clean carrier EOF dropped downlink payload that had already been
+   decoded and queued for a slow TCP consumer: session.closeCarrier closed
+   the session immediately. A carrier FIN now queues the EOF behind the
+   queued payload and lets runDownlink finish after the last write; resets
+   and protocol errors keep the reset path. UDP already drained.
+2. A carrier whose frame write had failed kept reporting itself available
+   until the asynchronous close ran, so Pool.DialContext could return a
+   session that was dead before its first byte. fail() now marks the worker
+   failed synchronously and allocateIDLocked checks it.
+
+Tests: TestFaultInjectionDelayedEcho, TestFaultInjectionBandwidthThrottle,
+TestFaultInjectionWriteStallExceedsFrameTimeout,
+TestFaultInjectionServerStopsReading, TestFaultInjectionShortWrites,
+TestFaultInjectionPartialWriteFailureClosesCarrier,
+TestFaultInjectionPeerEOF, TestFaultInjectionPeerReset,
+TestFaultInjectionBlackholedPeer, TestFaultedCarrierRefusesNewSessions,
+TestNoGoroutineLeakAfterMixedWorkload, TestSoakMixedSessionsUnderFaults.
+diff --git a/transport/muxcool/fault_carrier_test.go b/transport/muxcool/fault_carrier_test.go
+new file mode 100644
+index 0000000..10fdb9d
+--- /dev/null
++++ b/transport/muxcool/fault_carrier_test.go
+@@ -0,0 +1,250 @@
++package muxcool
++
++import (
++	"context"
++	"math/rand/v2"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// The fault-injection harness for the mux.cool verification suite. A
++// faultConn wraps a carrier net.Conn and injects one deterministic class of
++// network trouble per scenario: latency, jitter, bandwidth throttling, a
++// temporary write stall, short writes, a partial write failure, or a peer
++// that stops reading. Carrier death (EOF, reset, blackhole) is produced by
++// the dialer that owns the peer side, because a real peer disappears by
++// closing the socket, not by returning a crafted error from Read.
++
++// faultSpec is immutable for the life of one faultConn: a scenario creates a
++// dialer whose spec function returns a fresh value per carrier, so every
++// carrier of one test sees the same fault.
++type faultSpec struct {
++	readDelay   time.Duration
++	writeDelay  time.Duration
++	jitter      time.Duration
++	seed        int64
++	shortWrite  int
++	stallWrites int
++	stallFor    time.Duration
++	failWrite   int
++	writeErr    error
++	readRate    int
++	writeRate   int
++}
++
++// tokenBucket throttles one direction to rate bytes per second with a burst
++// of one second. Tests use it to prove that a slow but live link still
++// completes a session instead of tripping the carrier write timeout.
++type tokenBucket struct {
++	mu     sync.Mutex
++	rate   float64
++	tokens float64
++	last   time.Time
++}
++
++func newTokenBucket(rate int) *tokenBucket {
++	if rate <= 0 {
++		return nil
++	}
++	return &tokenBucket{rate: float64(rate), tokens: float64(rate), last: time.Now()}
++}
++
++func (b *tokenBucket) wait(n int) {
++	if b == nil || n <= 0 {
++		return
++	}
++	b.mu.Lock()
++	now := time.Now()
++	b.tokens += now.Sub(b.last).Seconds() * b.rate
++	if b.tokens > b.rate {
++		b.tokens = b.rate
++	}
++	b.last = now
++	b.tokens -= float64(n)
++	var sleep time.Duration
++	if b.tokens < 0 {
++		sleep = time.Duration(-b.tokens / b.rate * float64(time.Second))
++		b.tokens = 0
++	}
++	b.mu.Unlock()
++	if sleep > 0 {
++		time.Sleep(sleep)
++	}
++}
++
++type faultConn struct {
++	net.Conn
++	spec        faultSpec
++	rngMu       sync.Mutex
++	rng         *rand.Rand
++	writes      atomic.Int64
++	readBucket  *tokenBucket
++	writeBucket *tokenBucket
++}
++
++func newFaultConn(conn net.Conn, spec faultSpec) *faultConn {
++	c := &faultConn{
++		Conn:        conn,
++		spec:        spec,
++		readBucket:  newTokenBucket(spec.readRate),
++		writeBucket: newTokenBucket(spec.writeRate),
++	}
++	if spec.jitter > 0 {
++		seed := spec.seed
++		if seed == 0 {
++			seed = 1
++		}
++		c.rng = rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0x9e3779b97f4a7c15))
++	}
++	return c
++}
++
++func (c *faultConn) delay(base time.Duration) {
++	if base <= 0 && c.rng == nil {
++		return
++	}
++	delay := base
++	if c.rng != nil && c.spec.jitter > 0 {
++		c.rngMu.Lock()
++		delay += time.Duration(c.rng.Int64N(int64(c.spec.jitter) + 1))
++		c.rngMu.Unlock()
++	}
++	if delay > 0 {
++		time.Sleep(delay)
++	}
++}
++
++func (c *faultConn) Read(p []byte) (int, error) {
++	c.delay(c.spec.readDelay)
++	if c.readBucket != nil {
++		c.readBucket.wait(len(p))
++	}
++	return c.Conn.Read(p)
++}
++
++func (c *faultConn) Write(p []byte) (int, error) {
++	c.delay(c.spec.writeDelay)
++	if c.writeBucket != nil {
++		c.writeBucket.wait(len(p))
++	}
++	index := c.writes.Add(1)
++	if c.spec.stallWrites > 0 && index <= int64(c.spec.stallWrites) && c.spec.stallFor > 0 {
++		// The worker already set its frame deadline on the underlying conn.
++		// Sleeping past it is what a peer window that never opens looks like:
++		// the physical write then fails with os.ErrDeadlineExceeded.
++		time.Sleep(c.spec.stallFor)
++	}
++	if c.spec.failWrite > 0 && index == int64(c.spec.failWrite) {
++		n := len(p) / 2
++		if n == 0 {
++			n = 1
++		}
++		return n, c.spec.writeErr
++	}
++	if c.spec.shortWrite > 0 && len(p) > c.spec.shortWrite {
++		return c.Conn.Write(p[:c.spec.shortWrite])
++	}
++	return c.Conn.Write(p)
++}
++
++type faultDialerMode int
++
++const (
++	// faultEchoTCP serves raw mux.cool frames back on the peer side.
++	faultEchoTCP faultDialerMode = iota
++	// faultEchoUDP serves raw XUDP frames back on the peer side.
++	faultEchoUDP
++	// faultBlackhole accepts the carrier and then neither reads nor writes,
++	// which is what a peer behind a dropped route looks like.
++	faultBlackhole
++)
++
++// faultDialer owns the peer side of every carrier it dials so a test can kill
++// a carrier the way a server does: by closing its socket.
++type faultDialer struct {
++	mode faultDialerMode
++	spec func() faultSpec
++
++	mu      sync.Mutex
++	calls   int
++	servers []net.Conn
++	clients []net.Conn
++	dialErr error
++}
++
++func (d *faultDialer) dial(context.Context) (net.Conn, error) {
++	d.mu.Lock()
++	d.calls++
++	if d.dialErr != nil {
++		err := d.dialErr
++		d.mu.Unlock()
++		return nil, err
++	}
++	d.mu.Unlock()
++
++	client, server := net.Pipe()
++	switch d.mode {
++	case faultEchoTCP:
++		go serveIndependentEcho(server)
++	case faultEchoUDP:
++		go serveIndependentPacketEcho(server, nil)
++	case faultBlackhole:
++		// Nobody touches the peer side; Read blocks, Write blocks until the
++		// writer's own deadline fires.
++	}
++
++	spec := faultSpec{}
++	if d.spec != nil {
++		spec = d.spec()
++	}
++	faulty := newFaultConn(client, spec)
++
++	d.mu.Lock()
++	d.servers = append(d.servers, server)
++	d.clients = append(d.clients, faulty)
++	d.mu.Unlock()
++	return faulty, nil
++}
++
++func (d *faultDialer) callCount() int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.calls
++}
++
++// killOldest closes up to n peer sockets. The oldest carrier is the one a
++// rotation or a server restart takes down first.
++func (d *faultDialer) killOldest(n int) int {
++	d.mu.Lock()
++	if n > len(d.servers) {
++		n = len(d.servers)
++	}
++	victims := append([]net.Conn(nil), d.servers[:n]...)
++	d.servers = d.servers[n:]
++	d.mu.Unlock()
++	for _, victim := range victims {
++		_ = victim.Close()
++	}
++	return len(victims)
++}
++
++func (d *faultDialer) closeServers() {
++	d.mu.Lock()
++	servers := d.servers
++	d.servers = nil
++	d.mu.Unlock()
++	for _, server := range servers {
++		_ = server.Close()
++	}
++}
++
++func faultPoolOptions() Options {
++	return Options{
++		MaxConcurrency:      8,
++		MaxConnections:      128,
++		FirstPayloadTimeout: 100 * time.Millisecond,
++		IdleTimeout:         time.Hour,
++	}
++}
+diff --git a/transport/muxcool/fault_injection_test.go b/transport/muxcool/fault_injection_test.go
+new file mode 100644
+index 0000000..2136cd3
+--- /dev/null
++++ b/transport/muxcool/fault_injection_test.go
+@@ -0,0 +1,565 @@
++package muxcool
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"syscall"
++	"testing"
++	"time"
++)
++
++var faultUDPTarget = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("1.1.1.1:53"))
++
++func tcpEchoRoundTrip(t *testing.T, pool *Pool, payload []byte) time.Duration {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	conn, err := pool.DialContext(ctx, "fault.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	defer func() { _ = conn.Close() }()
++	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatalf("set deadline: %v", err)
++	}
++	start := time.Now()
++	if _, err := conn.Write(payload); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	got := make([]byte, len(payload))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatalf("read echo: %v", err)
++	}
++	if !bytes.Equal(got, payload) {
++		t.Fatalf("echo payload differs: got %d bytes, want %d", len(got), len(payload))
++	}
++	return time.Since(start)
++}
++
++func udpEchoRoundTrip(t *testing.T, pool *Pool, payload []byte) time.Duration {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	packetConn, err := pool.ListenPacketContext(ctx, "fault-udp.example", 443, [8]byte{})
++	if err != nil {
++		t.Fatalf("open packet session: %v", err)
++	}
++	defer func() { _ = packetConn.Close() }()
++	if err := packetConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		t.Fatalf("set deadline: %v", err)
++	}
++	start := time.Now()
++	if _, err := packetConn.WriteTo(payload, faultUDPTarget); err != nil {
++		t.Fatalf("WriteTo: %v", err)
++	}
++	buffer := make([]byte, len(payload)+16)
++	n, _, err := packetConn.ReadFrom(buffer)
++	if err != nil {
++		t.Fatalf("ReadFrom: %v", err)
++	}
++	if !bytes.Equal(buffer[:n], payload) {
++		t.Fatalf("echo datagram differs: got %d bytes, want %d", n, len(payload))
++	}
++	return time.Since(start)
++}
++
++// TestFaultInjectionDelayedEcho keeps both session kinds correct under the
++// latency and jitter a mobile link adds. Every read and write of the carrier
++// pays the delay, which is what the protocol sees; correctness and a bounded
++// round trip are the assertions.
++func TestFaultInjectionDelayedEcho(t *testing.T) {
++	const networkDelay = 250 * time.Millisecond
++	cases := []struct {
++		name string
++		spec faultSpec
++	}{
++		{name: "no-delay"},
++		{name: "20ms", spec: faultSpec{readDelay: 20 * time.Millisecond, writeDelay: 20 * time.Millisecond}},
++		{name: "250ms", spec: faultSpec{readDelay: networkDelay, writeDelay: networkDelay}},
++		{name: "20ms-jitter", spec: faultSpec{
++			readDelay: 20 * time.Millisecond, writeDelay: 20 * time.Millisecond,
++			jitter: 5 * time.Millisecond, seed: 7,
++		}},
++	}
++	for _, testCase := range cases {
++		testCase := testCase
++		for _, protocol := range []string{"tcp", "udp"} {
++			protocol := protocol
++			t.Run(protocol+"/"+testCase.name, func(t *testing.T) {
++				baseline := goroutineBaseline()
++				mode := faultEchoTCP
++				if protocol == "udp" {
++					mode = faultEchoUDP
++				}
++				dialer := &faultDialer{mode: mode, spec: func() faultSpec { return testCase.spec }}
++				t.Cleanup(dialer.closeServers)
++				pool := NewPool(dialer.dial, faultPoolOptions())
++
++				payload := bytes.Repeat([]byte("delay-"), 32)
++				var elapsed time.Duration
++				if protocol == "udp" {
++					elapsed = udpEchoRoundTrip(t, pool, payload)
++				} else {
++					elapsed = tcpEchoRoundTrip(t, pool, payload)
++				}
++				// Four framed reads plus two writes pay the delay; a healthy
++				// run stays well under a second per applied delay.
++				limit := time.Second + 5*(testCase.spec.readDelay+testCase.spec.writeDelay) + testCase.spec.jitter
++				if elapsed > limit {
++					t.Fatalf("round trip = %v, want <= %v", elapsed, limit)
++				}
++				if err := pool.Close(); err != nil {
++					t.Fatalf("pool close: %v", err)
++				}
++				waitForGoroutines(t, baseline+4, 2*time.Second)
++			})
++		}
++	}
++}
++
++// TestFaultInjectionBandwidthThrottle proves the token-bucket slow link still
++// completes a session: a throttled carrier is slow, not dead, so it must not
++// be closed by the write timeout.
++func TestFaultInjectionBandwidthThrottle(t *testing.T) {
++	baseline := goroutineBaseline()
++	dialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec {
++		return faultSpec{
++			readRate: 2048, writeRate: 2048,
++			shortWrite: 24,
++			readDelay:  time.Millisecond, writeDelay: time.Millisecond,
++			jitter: 2 * time.Millisecond, seed: 11,
++		}
++	}}
++	t.Cleanup(dialer.closeServers)
++	options := faultPoolOptions()
++	options.WriteTimeout = time.Second
++	pool := NewPool(dialer.dial, options)
++
++	payload := bytes.Repeat([]byte{0x7e}, 256)
++	elapsed := tcpEchoRoundTrip(t, pool, payload)
++	if elapsed > 3*time.Second {
++		t.Fatalf("throttled round trip = %v, want <= 3s", elapsed)
++	}
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultInjectionWriteStallExceedsFrameTimeout covers a peer that stops
++// accepting bytes for longer than the carrier write timeout: the write fails,
++// the carrier closes, the error is ErrCarrierWriteTimeout, and the pool dials
++// a healthy replacement for the next session.
++func TestFaultInjectionWriteStallExceedsFrameTimeout(t *testing.T) {
++	baseline := goroutineBaseline()
++	var dials int
++	dialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec {
++		dials++
++		if dials == 1 {
++			return faultSpec{stallWrites: 1, stallFor: 200 * time.Millisecond}
++		}
++		return faultSpec{}
++	}}
++	t.Cleanup(dialer.closeServers)
++	options := faultPoolOptions()
++	options.WriteTimeout = 40 * time.Millisecond
++	pool := NewPool(dialer.dial, options)
++
++	conn, err := pool.DialContext(context.Background(), "stall.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	if _, err := conn.Write([]byte("stalled")); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	start := time.Now()
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrCarrierWriteTimeout) {
++		t.Fatalf("read error = %v, want %v", err, ErrCarrierWriteTimeout)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("stalled carrier error took %v, want <= 1s", elapsed)
++	}
++	_ = conn.Close()
++	waitFor(t, func() bool { return pool.Stats().Carriers == 0 })
++
++	// The pool recovers: the next session goes on a fresh, healthy carrier.
++	roundTrip := tcpEchoRoundTrip(t, pool, []byte("recovered"))
++	if roundTrip > time.Second {
++		t.Fatalf("post-fault round trip = %v", roundTrip)
++	}
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultInjectionServerStopsReading pins the sibling guarantee at the
++// worker level: one carrier whose peer never reads dies, the other carrier's
++// session keeps echoing.
++func TestFaultInjectionServerStopsReading(t *testing.T) {
++	baseline := goroutineBaseline()
++
++	stalledClient, stalledServer := net.Pipe()
++	t.Cleanup(func() { _ = stalledServer.Close() })
++	stalled := newCarrierWorker(newFaultConn(stalledClient, faultSpec{
++		stallWrites: 1, stallFor: 200 * time.Millisecond,
++	}), 8, 128, nil)
++	stalled.writeTimeout.Store(int64(40 * time.Millisecond))
++	t.Cleanup(func() { stalled.close(nil) })
++
++	healthyClient, healthyServer := net.Pipe()
++	go serveIndependentEcho(healthyServer)
++	healthy := newCarrierWorker(healthyClient, 8, 128, nil)
++	t.Cleanup(func() { healthy.close(nil) })
++
++	stalledConn, err := stalled.openSession(context.Background(), "stalled.example", 443, time.Hour)
++	if err != nil {
++		t.Fatalf("open stalled session: %v", err)
++	}
++	t.Cleanup(func() { _ = stalledConn.Close() })
++	healthyConn, err := healthy.openSession(context.Background(), "healthy.example", 443, time.Hour)
++	if err != nil {
++		t.Fatalf("open healthy session: %v", err)
++	}
++	t.Cleanup(func() { _ = healthyConn.Close() })
++
++	if _, err := stalledConn.Write([]byte("stuck")); err != nil {
++		t.Fatalf("stalled write: %v", err)
++	}
++	start := time.Now()
++	_ = stalledConn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if _, err := stalledConn.Read(make([]byte, 1)); !errors.Is(err, ErrCarrierWriteTimeout) {
++		t.Fatalf("stalled session read = %v, want %v", err, ErrCarrierWriteTimeout)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("stalled session error took %v", elapsed)
++	}
++
++	_ = healthyConn.SetDeadline(time.Now().Add(time.Second))
++	if _, err := healthyConn.Write([]byte("sibling")); err != nil {
++		t.Fatalf("sibling write after the other carrier died: %v", err)
++	}
++	got := make([]byte, len("sibling"))
++	if _, err := io.ReadFull(healthyConn, got); err != nil {
++		t.Fatalf("sibling read: %v", err)
++	}
++	if string(got) != "sibling" {
++		t.Fatalf("sibling payload = %q", got)
++	}
++	if healthy.closedFast.Load() {
++		t.Fatal("the sibling carrier was closed by another carrier's timeout")
++	}
++
++	healthy.close(nil)
++	stalled.close(nil)
++	waitForGoroutines(t, baseline+2, 2*time.Second)
++}
++
++// TestFaultInjectionShortWrites feeds the encoder through a carrier that
++// returns short counts with nil errors, the way a partial socket write can.
++// writeFull must loop and the frames must decode intact at the echo peer.
++func TestFaultInjectionShortWrites(t *testing.T) {
++	baseline := goroutineBaseline()
++	dialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec {
++		return faultSpec{shortWrite: 5}
++	}}
++	t.Cleanup(dialer.closeServers)
++	pool := NewPool(dialer.dial, faultPoolOptions())
++
++	payload := bytes.Repeat([]byte{0xa5}, 700)
++	if elapsed := tcpEchoRoundTrip(t, pool, payload); elapsed > 2*time.Second {
++		t.Fatalf("short-write round trip = %v", elapsed)
++	}
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultInjectionPartialWriteFailureClosesCarrier is the half-written
++// frame case: a short count together with an error. The stream cannot be
++// resumed, so the carrier must close and the session must report the cause.
++func TestFaultInjectionPartialWriteFailureClosesCarrier(t *testing.T) {
++	baseline := goroutineBaseline()
++	writeErr := errors.New("injected partial write failure")
++	dialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec {
++		return faultSpec{failWrite: 1, writeErr: writeErr}
++	}}
++	t.Cleanup(dialer.closeServers)
++	pool := NewPool(dialer.dial, faultPoolOptions())
++
++	conn, err := pool.DialContext(context.Background(), "partial.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	_, _ = conn.Write([]byte("partial"))
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	start := time.Now()
++	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, writeErr) {
++		t.Fatalf("read error = %v, want %v", err, writeErr)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("partial write error took %v", elapsed)
++	}
++	waitFor(t, func() bool { return pool.Stats().Carriers == 0 })
++
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultInjectionPeerEOF delivers a clean TCP FIN after one echo. The
++// carrier read loop sees io.EOF, closes the carrier, and the session reports
++// it; the pool counts the close as an error and does not keep the carrier.
++func TestFaultInjectionPeerEOF(t *testing.T) {
++	baseline := goroutineBaseline()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	t.Cleanup(func() { _ = listener.Close() })
++	go func() {
++		for {
++			conn, acceptErr := listener.Accept()
++			if acceptErr != nil {
++				return
++			}
++			go func(peer net.Conn) {
++				defer func() { _ = peer.Close() }()
++				tcpPeer := peer.(*net.TCPConn)
++				for {
++					frame, readErr := readIndependentFrame(peer)
++					if readErr != nil {
++						return
++					}
++					if frame.status == 3 || frame.option&1 == 0 {
++						continue
++					}
++					if writeErr := writeIndependentKeep(peer, frame.sessionID, frame.payload); writeErr != nil {
++						return
++					}
++					if closeErr := tcpPeer.CloseWrite(); closeErr != nil {
++						return
++					}
++					// Hold the read half open until the client closes, so the
++					// FIN is a clean half-close and not a reset.
++					_, _ = io.Copy(io.Discard, peer)
++					return
++				}
++			}(conn)
++		}
++	}()
++
++	pool := NewPool(func(ctx context.Context) (net.Conn, error) {
++		dialer := net.Dialer{Timeout: time.Second}
++		return dialer.DialContext(ctx, "tcp", listener.Addr().String())
++	}, faultPoolOptions())
++
++	conn, err := pool.DialContext(context.Background(), "eof.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	if _, err := conn.Write([]byte("last")); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	got := make([]byte, len("last"))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatalf("read echo before EOF: %v", err)
++	}
++	if string(got) != "last" {
++		t.Fatalf("echo payload = %q", got)
++	}
++	start := time.Now()
++	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
++		t.Fatalf("read after peer FIN = %v, want io.EOF", err)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("EOF surfaced after %v", elapsed)
++	}
++	waitFor(t, func() bool {
++		stats := pool.Stats()
++		return stats.Carriers == 0 && stats.CarrierCloses["error"] == 1
++	})
++
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultInjectionPeerReset closes the peer socket with SO_LINGER 0 after
++// one echo, which is a TCP reset: the carrier read loop sees ECONNRESET, the
++// session reports that cause instead of a clean EOF, and nothing waits on the
++// dead link.
++func TestFaultInjectionPeerReset(t *testing.T) {
++	baseline := goroutineBaseline()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	t.Cleanup(func() { _ = listener.Close() })
++	go func() {
++		for {
++			conn, acceptErr := listener.Accept()
++			if acceptErr != nil {
++				return
++			}
++			go func(peer net.Conn) {
++				tcpPeer, ok := peer.(*net.TCPConn)
++				if !ok {
++					_ = peer.Close()
++					return
++				}
++				for {
++					frame, readErr := readIndependentFrame(peer)
++					if readErr != nil {
++						_ = peer.Close()
++						return
++					}
++					if frame.status == 3 || frame.option&1 == 0 {
++						continue
++					}
++					if writeErr := writeIndependentKeep(peer, frame.sessionID, frame.payload); writeErr != nil {
++						_ = peer.Close()
++						return
++					}
++					// Wait for the caller's next frame so the echo is
++					// certainly delivered before the reset.
++					if _, readErr = readIndependentFrame(peer); readErr != nil {
++						_ = peer.Close()
++						return
++					}
++					_ = tcpPeer.SetLinger(0)
++					_ = tcpPeer.Close()
++					return
++				}
++			}(conn)
++		}
++	}()
++
++	pool := NewPool(func(ctx context.Context) (net.Conn, error) {
++		dialer := net.Dialer{Timeout: time.Second}
++		return dialer.DialContext(ctx, "tcp", listener.Addr().String())
++	}, faultPoolOptions())
++
++	conn, err := pool.DialContext(context.Background(), "reset.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
++	if _, err := conn.Write([]byte("reset")); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	got := make([]byte, len("reset"))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatalf("read echo before reset: %v", err)
++	}
++	if _, err := conn.Write([]byte("done")); err != nil {
++		t.Fatalf("write after echo: %v", err)
++	}
++
++	start := time.Now()
++	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
++		t.Fatalf("read after peer reset = %v, want ECONNRESET", err)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("reset surfaced after %v", elapsed)
++	}
++	waitFor(t, func() bool {
++		stats := pool.Stats()
++		return stats.Carriers == 0 && stats.CarrierCloses["error"] == 1
++	})
++
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
++
++// TestFaultedCarrierRefusesNewSessions pins the synchronous part of the fix:
++// a failed frame write marks the carrier unusable before the asynchronous
++// close runs, so the pool cannot hand a caller a session that is already
++// dead.
++func TestFaultedCarrierRefusesNewSessions(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++
++	worker.fail(errors.New("write failed"))
++	worker.mu.Lock()
++	available := worker.availableLocked()
++	worker.mu.Unlock()
++	if available {
++		t.Fatal("a failed carrier still reports itself available")
++	}
++	if _, err := worker.openSession(context.Background(), "late.example", 80, time.Hour); err == nil {
++		t.Fatal("a failed carrier opened a session")
++	}
++}
++
++// TestFaultInjectionBlackholedPeer covers a peer that accepts the TCP
++// connection and then says nothing and reads nothing: a write must fail on
++// the frame timeout, and closing an idle session must not wait for the dead
++// carrier.
++func TestFaultInjectionBlackholedPeer(t *testing.T) {
++	baseline := goroutineBaseline()
++	dialer := &faultDialer{mode: faultBlackhole}
++	t.Cleanup(dialer.closeServers)
++	options := faultPoolOptions()
++	options.WriteTimeout = 40 * time.Millisecond
++	// The idle-close part must observe only the session read deadline. A
++	// first-payload timer would race it with a New frame and turn the expected
++	// os.ErrDeadlineExceeded into a carrier write timeout.
++	options.FirstPayloadTimeout = time.Hour
++	pool := NewPool(dialer.dial, options)
++
++	conn, err := pool.DialContext(context.Background(), "blackhole.example", 443)
++	if err != nil {
++		t.Fatalf("dial: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	if _, err := conn.Write([]byte("void")); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	start := time.Now()
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrCarrierWriteTimeout) {
++		t.Fatalf("read error = %v, want %v", err, ErrCarrierWriteTimeout)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("blackholed write error took %v", elapsed)
++	}
++
++	idle, err := pool.DialContext(context.Background(), "idle.example", 443)
++	if err != nil {
++		t.Fatalf("dial idle: %v", err)
++	}
++	start = time.Now()
++	_ = idle.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
++	if _, err := idle.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("idle read after %v = %v, want deadline exceeded", time.Since(start), err)
++	}
++	start = time.Now()
++	if err := idle.Close(); err != nil {
++		t.Fatalf("idle close: %v", err)
++	}
++	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
++		t.Fatalf("idle close took %v, want <= 100ms", elapsed)
++	}
++
++	if err := pool.Close(); err != nil {
++		t.Fatalf("pool close: %v", err)
++	}
++	waitForGoroutines(t, baseline+4, 2*time.Second)
++}
+diff --git a/transport/muxcool/goroutine_leak_test.go b/transport/muxcool/goroutine_leak_test.go
+new file mode 100644
+index 0000000..29580ab
+--- /dev/null
++++ b/transport/muxcool/goroutine_leak_test.go
+@@ -0,0 +1,121 @@
++package muxcool
++
++import (
++	"context"
++	"io"
++	"runtime"
++	"testing"
++	"time"
++)
++
++// Goroutine hygiene for the transport tests. go.mod carries no leak-detector
++// dependency, so the check is runtime.NumGoroutine with a bounded retry and a
++// full stack dump on failure. A bounded retry is required: a closed carrier
++// wakes its pumps asynchronously, so an immediate count races the scheduler,
++// not the transport.
++
++func goroutineBaseline() int {
++	runtime.GC()
++	return runtime.NumGoroutine()
++}
++
++func goroutineDump() string {
++	buffer := make([]byte, 1<<20)
++	return string(buffer[:runtime.Stack(buffer, true)])
++}
++
++func waitForGoroutines(t *testing.T, limit int, timeout time.Duration) int {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for {
++		current := runtime.NumGoroutine()
++		if current <= limit {
++			return current
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("goroutines = %d, want <= %d after %v\n%s", current, limit, timeout, goroutineDump())
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++}
++
++// TestNoGoroutineLeakAfterMixedWorkload runs carrier rotation, deadline churn
++// and both session kinds against one pair of long-lived pools, then requires
++// the process goroutine count to fall back to the pre-workload baseline.
++func TestNoGoroutineLeakAfterMixedWorkload(t *testing.T) {
++	baseline := goroutineBaseline()
++
++	tcpDialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec {
++		return faultSpec{
++			readDelay: time.Millisecond, writeDelay: time.Millisecond,
++			jitter: 2 * time.Millisecond, seed: 3, shortWrite: 48,
++		}
++	}}
++	t.Cleanup(tcpDialer.closeServers)
++	udpDialer := &faultDialer{mode: faultEchoUDP, spec: func() faultSpec {
++		return faultSpec{readDelay: time.Millisecond, jitter: time.Millisecond, seed: 5}
++	}}
++	t.Cleanup(udpDialer.closeServers)
++
++	tcpOptions := faultPoolOptions()
++	tcpOptions.MaxConcurrency = 2
++	tcpOptions.MaxConnections = 4
++	udpOptions := faultPoolOptions()
++	udpOptions.MaxConcurrency = 2
++	udpOptions.MaxConnections = 4
++	tcpPool := NewPool(tcpDialer.dial, tcpOptions)
++	udpPool := NewPool(udpDialer.dial, udpOptions)
++
++	payload := []byte("leak-check")
++	for iteration := 0; iteration < 40; iteration++ {
++		// TCP: open, churn deadlines, echo, and sometimes close unread.
++		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++		conn, err := tcpPool.DialContext(ctx, "leak.example", 443)
++		cancel()
++		if err != nil {
++			t.Fatalf("iteration %d: dial: %v", iteration, err)
++		}
++		_ = conn.SetDeadline(time.Now().Add(time.Second))
++		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
++		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++		if _, err := conn.Write(payload); err != nil {
++			t.Fatalf("iteration %d: write: %v", iteration, err)
++		}
++		got := make([]byte, len(payload))
++		if _, err := io.ReadFull(conn, got); err != nil {
++			t.Fatalf("iteration %d: read: %v", iteration, err)
++		}
++		if iteration%7 == 0 {
++			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
++		}
++		_ = conn.Close()
++
++		// UDP: same churn on the packet path.
++		packetCtx, packetCancel := context.WithTimeout(context.Background(), 2*time.Second)
++		packetConn, err := udpPool.ListenPacketContext(packetCtx, "leak-udp.example", 443, [8]byte{})
++		packetCancel()
++		if err != nil {
++			t.Fatalf("iteration %d: open packet: %v", iteration, err)
++		}
++		_ = packetConn.SetDeadline(time.Now().Add(time.Second))
++		_ = packetConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
++		_ = packetConn.SetReadDeadline(time.Now().Add(time.Second))
++		if _, err := packetConn.WriteTo(payload, faultUDPTarget); err != nil {
++			t.Fatalf("iteration %d: WriteTo: %v", iteration, err)
++		}
++		buffer := make([]byte, len(payload))
++		if _, _, err := packetConn.ReadFrom(buffer); err != nil {
++			t.Fatalf("iteration %d: ReadFrom: %v", iteration, err)
++		}
++		_ = packetConn.Close()
++	}
++
++	if err := tcpPool.Close(); err != nil {
++		t.Fatalf("TCP pool close: %v", err)
++	}
++	if err := udpPool.Close(); err != nil {
++		t.Fatalf("UDP pool close: %v", err)
++	}
++	after := waitForGoroutines(t, baseline+4, 5*time.Second)
++	t.Logf("goroutines: baseline %d, after mixed workload %d", baseline, after)
++}
+diff --git a/transport/muxcool/session.go b/transport/muxcool/session.go
+index 2c7de09..67dca7f 100644
+--- a/transport/muxcool/session.go
++++ b/transport/muxcool/session.go
+@@ -311,6 +311,16 @@ func (s *session) enqueueDownlink(message downlinkMessage) error {
+ }
+ 
+ func (s *session) closeCarrier(cause error) {
++	if errors.Is(cause, io.EOF) {
++		// A clean carrier EOF is a FIN, not a reset: every frame already
++		// decoded and queued for this consumer is complete, so it must reach
++		// the caller before the session reports EOF. Queue the EOF behind
++		// that payload and let runDownlink finish the session after the last
++		// write, exactly as it does for a remote End. A reset or a protocol
++		// error keeps the reset path, because the peer aborted the stream.
++		_ = s.enqueueDownlink(downlinkMessage{terminal: true, cause: cause})
++		return
++	}
+ 	s.finish(cause, false)
+ }
+ 
+diff --git a/transport/muxcool/soak_test.go b/transport/muxcool/soak_test.go
+new file mode 100644
+index 0000000..45ca905
+--- /dev/null
++++ b/transport/muxcool/soak_test.go
+@@ -0,0 +1,342 @@
++package muxcool
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// The soak is opt-in because it is a wall-clock stress run, not a unit test:
++//
++//	MIHOMO_SOAK_SECONDS=30 go test -run TestSoak -timeout 180s ./transport/muxcool/
++//
++// It mixes TCP and UDP sessions, carrier rotation, slow consumers that trip
++// ErrSessionOverflow, UDP datagram drops, and periodic carrier kills. The
++// contract under test is the same one the hardening series documented: a
++// session either echoes its payload, fails with one of the documented errors,
++// or is reset by its own overflow - never silently and never with a foreign
++// error - and the process goroutine count comes back to the pre-run baseline.
++
++func soakSettings(t *testing.T) (time.Duration, int) {
++	t.Helper()
++	rawSeconds := os.Getenv("MIHOMO_SOAK_SECONDS")
++	if rawSeconds == "" {
++		t.Skip("set MIHOMO_SOAK_SECONDS to run the mux.cool soak (e.g. MIHOMO_SOAK_SECONDS=30)")
++	}
++	seconds, err := strconv.Atoi(rawSeconds)
++	if err != nil || seconds <= 0 {
++		t.Fatalf("MIHOMO_SOAK_SECONDS = %q, want a positive integer", rawSeconds)
++	}
++	workers := 128
++	if rawWorkers := os.Getenv("MIHOMO_SOAK_WORKERS"); rawWorkers != "" {
++		parsed, err := strconv.Atoi(rawWorkers)
++		if err != nil || parsed < 100 {
++			t.Fatalf("MIHOMO_SOAK_WORKERS = %q, want an integer >= 100", rawWorkers)
++		}
++		workers = parsed
++	}
++	return time.Duration(seconds) * time.Second, workers
++}
++
++func soakCarrierSpec(seed *atomic.Int64) faultSpec {
++	return faultSpec{
++		readDelay:  time.Millisecond,
++		writeDelay: time.Millisecond,
++		jitter:     2 * time.Millisecond,
++		seed:       seed.Add(1),
++		shortWrite: 64,
++		readRate:   1 << 20,
++		writeRate:  1 << 20,
++	}
++}
++
++var soakAllowedErrors = []error{
++	ErrSessionOverflow,
++	ErrCarrierWriteTimeout,
++	ErrPoolClosed,
++	ErrPacketTooLarge,
++	errWorkerUnavailable,
++	net.ErrClosed,
++	io.EOF,
++	io.ErrClosedPipe,
++	io.ErrShortWrite,
++	os.ErrDeadlineExceeded,
++	context.Canceled,
++	context.DeadlineExceeded,
++	syscall.ECONNRESET,
++	syscall.EPIPE,
++}
++
++func soakErrorAllowed(err error) bool {
++	if err == nil {
++		return true
++	}
++	for _, allowed := range soakAllowedErrors {
++		if errors.Is(err, allowed) {
++			return true
++		}
++	}
++	return false
++}
++
++func soakPayload(worker, iteration int) []byte {
++	size := 1 + (worker*7+iteration*13)%512
++	payload := make([]byte, size)
++	for index := range payload {
++		payload[index] = byte(worker*31 + iteration*17 + index)
++	}
++	return payload
++}
++
++type soakOutcome struct {
++	echoed   bool
++	overflow bool
++}
++
++func soakTCPIteration(ctx context.Context, pool *Pool, worker, iteration int) (soakOutcome, error) {
++	switch iteration % 12 {
++	case 0:
++		// A consumer that never reads: its bounded downlink queue must reset
++		// only this session once it is more than sessionDownlinkFrames behind.
++		conn, err := pool.DialContext(ctx, fmt.Sprintf("slow-%d.example", worker), 443)
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		defer func() { _ = conn.Close() }()
++		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
++		for index := 0; index < sessionDownlinkFrames+16; index++ {
++			if _, err := conn.Write([]byte("x")); err != nil {
++				return soakOutcome{}, err
++			}
++		}
++		_, err = conn.Read(make([]byte, 1))
++		return soakOutcome{overflow: errors.Is(err, ErrSessionOverflow)}, err
++	case 1:
++		// Open and close before the first payload: the first-payload timer
++		// and the End frame race, and neither may leak.
++		conn, err := pool.DialContext(ctx, fmt.Sprintf("churn-%d.example", worker), 443)
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		return soakOutcome{}, conn.Close()
++	default:
++		payload := soakPayload(worker, iteration)
++		conn, err := pool.DialContext(ctx, fmt.Sprintf("soak-%d.example", worker), 443)
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		defer func() { _ = conn.Close() }()
++		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
++		if _, err := conn.Write(payload); err != nil {
++			return soakOutcome{}, err
++		}
++		echo := make([]byte, len(payload))
++		if _, err := io.ReadFull(conn, echo); err != nil {
++			return soakOutcome{}, err
++		}
++		if !bytes.Equal(echo, payload) {
++			return soakOutcome{}, fmt.Errorf("TCP echo differs: got %d bytes, want %d", len(echo), len(payload))
++		}
++		return soakOutcome{echoed: true}, nil
++	}
++}
++
++func soakUDPIteration(ctx context.Context, pool *Pool, worker, iteration int) (soakOutcome, error) {
++	switch iteration % 12 {
++	case 0:
++		// A UDP consumer that never reads: the queue is allowed to drop
++		// datagrams, and the pool counts every drop.
++		packetConn, err := pool.ListenPacketContext(ctx, fmt.Sprintf("flood-%d.example", worker), 53, [8]byte{})
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		defer func() { _ = packetConn.Close() }()
++		_ = packetConn.SetDeadline(time.Now().Add(2 * time.Second))
++		for index := 0; index < packetDownlinkFrames+32; index++ {
++			if _, err := packetConn.WriteTo([]byte("drop"), faultUDPTarget); err != nil {
++				return soakOutcome{}, err
++			}
++		}
++		return soakOutcome{}, nil
++	case 1:
++		packetConn, err := pool.ListenPacketContext(ctx, fmt.Sprintf("churn-udp-%d.example", worker), 53, [8]byte{})
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		return soakOutcome{}, packetConn.Close()
++	default:
++		payload := soakPayload(worker, iteration)
++		packetConn, err := pool.ListenPacketContext(ctx, fmt.Sprintf("soak-udp-%d.example", worker), 53, [8]byte{})
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		defer func() { _ = packetConn.Close() }()
++		_ = packetConn.SetDeadline(time.Now().Add(2 * time.Second))
++		if _, err := packetConn.WriteTo(payload, faultUDPTarget); err != nil {
++			return soakOutcome{}, err
++		}
++		buffer := make([]byte, len(payload)+16)
++		n, _, err := packetConn.ReadFrom(buffer)
++		if err != nil {
++			return soakOutcome{}, err
++		}
++		if !bytes.Equal(buffer[:n], payload) {
++			return soakOutcome{}, fmt.Errorf("UDP echo differs: got %d bytes, want %d", n, len(payload))
++		}
++		return soakOutcome{echoed: true}, nil
++	}
++}
++
++func TestSoakMixedSessionsUnderFaults(t *testing.T) {
++	duration, workers := soakSettings(t)
++	baseline := goroutineBaseline()
++
++	tcpSeed := &atomic.Int64{}
++	udpSeed := &atomic.Int64{}
++	tcpDialer := &faultDialer{mode: faultEchoTCP, spec: func() faultSpec { return soakCarrierSpec(tcpSeed) }}
++	udpDialer := &faultDialer{mode: faultEchoUDP, spec: func() faultSpec { return soakCarrierSpec(udpSeed) }}
++	t.Cleanup(func() {
++		tcpDialer.closeServers()
++		udpDialer.closeServers()
++	})
++
++	tcpOptions := faultPoolOptions()
++	tcpOptions.MaxConcurrency = 4
++	tcpOptions.MaxConnections = 6
++	tcpOptions.IdleTimeout = 2 * time.Second
++	tcpOptions.WriteTimeout = 300 * time.Millisecond
++	udpOptions := tcpOptions
++	tcpPool := NewPool(tcpDialer.dial, tcpOptions)
++	udpPool := NewPool(udpDialer.dial, udpOptions)
++
++	var (
++		iterations atomic.Int64
++		echoes     atomic.Int64
++		overflows  atomic.Int64
++		kills      atomic.Int64
++	)
++	var unexpectedMu sync.Mutex
++	var unexpected []string
++	record := func(where string, err error) {
++		if soakErrorAllowed(err) {
++			return
++		}
++		unexpectedMu.Lock()
++		if len(unexpected) < 20 {
++			unexpected = append(unexpected, where+": "+err.Error())
++		}
++		unexpectedMu.Unlock()
++	}
++
++	stop := make(chan struct{})
++	deadline := time.Now().Add(duration)
++	var wg sync.WaitGroup
++	for worker := 0; worker < workers; worker++ {
++		wg.Add(1)
++		go func(worker int) {
++			defer wg.Done()
++			protocol := "tcp"
++			if worker%2 == 1 {
++				protocol = "udp"
++			}
++			for iteration := 0; ; iteration++ {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				if !time.Now().Before(deadline) {
++					return
++				}
++				iterations.Add(1)
++				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++				var outcome soakOutcome
++				var err error
++				if protocol == "tcp" {
++					outcome, err = soakTCPIteration(ctx, tcpPool, worker, iteration)
++				} else {
++					outcome, err = soakUDPIteration(ctx, udpPool, worker, iteration)
++				}
++				cancel()
++				if outcome.echoed {
++					echoes.Add(1)
++				}
++				if outcome.overflow || errors.Is(err, ErrSessionOverflow) {
++					overflows.Add(1)
++				}
++				record(fmt.Sprintf("%s worker %d iteration %d", protocol, worker, iteration), err)
++			}
++		}(worker)
++	}
++
++	killStop := make(chan struct{})
++	killDone := make(chan struct{})
++	go func() {
++		defer close(killDone)
++		ticker := time.NewTicker(150 * time.Millisecond)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-killStop:
++				return
++			case <-ticker.C:
++				closed := tcpDialer.killOldest(1) + udpDialer.killOldest(1)
++				kills.Add(int64(closed))
++			}
++		}
++	}()
++
++	time.Sleep(duration)
++	close(stop)
++	wg.Wait()
++	close(killStop)
++	<-killDone
++
++	tcpStats := tcpPool.Stats()
++	udpStats := udpPool.Stats()
++	if err := tcpPool.Close(); err != nil {
++		t.Fatalf("TCP pool close: %v", err)
++	}
++	if err := udpPool.Close(); err != nil {
++		t.Fatalf("UDP pool close: %v", err)
++	}
++
++	if echoes.Load() == 0 {
++		t.Fatal("no session completed an echo")
++	}
++	if tcpStats.SessionOverflows == 0 {
++		t.Errorf("no TCP session overflow: stats %+v", tcpStats)
++	}
++	if udpStats.DroppedDatagrams == 0 {
++		t.Errorf("no UDP datagram drop: stats %+v", udpStats)
++	}
++	if overflows.Load() == 0 {
++		t.Error("no iteration observed ErrSessionOverflow")
++	}
++	if kills.Load() == 0 {
++		t.Error("no carrier was killed")
++	}
++
++	unexpectedMu.Lock()
++	problems := append([]string(nil), unexpected...)
++	unexpectedMu.Unlock()
++	if len(problems) > 0 {
++		t.Fatalf("unexpected session errors:\n%s", strings.Join(problems, "\n"))
++	}
++
++	after := waitForGoroutines(t, baseline+8, 20*time.Second)
++	t.Logf("soak %v: workers=%d iterations=%d echoes=%d sessionOverflows=%d tcpOverflowEvents=%d udpDrops=%d carrierKills=%d goroutines %d -> %d",
++		duration, workers, iterations.Load(), echoes.Load(), overflows.Load(),
++		tcpStats.SessionOverflows, udpStats.DroppedDatagrams, kills.Load(), baseline, after)
++}
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index 338c9fd..40da0e0 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -44,10 +44,15 @@ type carrierWorker struct {
+ 	draining   bool
+ 	closed     bool
+ 	closedFast atomic.Bool
+-	closeErr   error
+-	closeOnce  sync.Once
+-	failOnce   sync.Once
+-	closedCh   chan struct{}
++	// failed marks a carrier whose write has already failed but whose close
++	// goroutine has not run yet. It must stop accepting sessions at once:
++	// handing one out would give the caller a session that dies with the
++	// carrier before its first byte.
++	failed    atomic.Bool
++	closeErr  error
++	closeOnce sync.Once
++	failOnce  sync.Once
++	closedCh  chan struct{}
+ }
+ 
+ func newCarrierWorker(conn net.Conn, maxActive, maxLifetime int, onClosed func(*carrierWorker)) *carrierWorker {
+@@ -124,7 +129,7 @@ func (w *carrierWorker) allocateIDLocked() (uint16, error) {
+ }
+ 
+ func (w *carrierWorker) availableLocked() bool {
+-	return !w.closed && !w.draining && len(w.sessions) < w.maxActive && w.lifetime < w.maxLifetime && w.nextID < uint32(^uint16(0))
++	return !w.closed && !w.failed.Load() && !w.draining && len(w.sessions) < w.maxActive && w.lifetime < w.maxLifetime && w.nextID < uint32(^uint16(0))
+ }
+ 
+ func (w *carrierWorker) activeSessions() int {
+@@ -320,6 +325,10 @@ func (w *carrierWorker) closeCause() error {
+ // inline would re-enter the write turn held by the failing caller.
+ func (w *carrierWorker) fail(cause error) {
+ 	w.failOnce.Do(func() {
++		// The close runs in its own goroutine (see close), so the size of that
++		// window must not decide whether a new session lands on the dying
++		// carrier.
++		w.failed.Store(true)
+ 		go w.close(cause)
+ 	})
+ }

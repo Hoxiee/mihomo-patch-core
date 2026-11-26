@@ -44,6 +44,7 @@ xray/0053-muxcool-diagnostics.patch
 xray/0054-muxcool-protocol-hardening.patch
 xray/0055-muxcool-xray-interop.patch
 xray/0056-muxcool-expired-write-deadline.patch
+xray/0057-muxcool-soak-fault-injection.patch
 diagnostics/0001-probe-error-details.patch
 diagnostics/0002-proxy-transfer-test.patch
 diagnostics/0003-proxy-transfer-export.patch
