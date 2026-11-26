@@ -54,4 +54,8 @@ go mod download github.com/metacubex/mldsa
 
 # shellcheck disable=SC2046
 go test -tags with_gvisor -count=1 -timeout 600s $(cat "$ROOT/tool/packages.txt")
+# mux.cool is the one transport whose closes, timers and pools run on several
+# goroutines; repetition under the race detector is what catches a close that
+# only sometimes re-enters, or a session that leaks its goroutine.
+go test -race -count=20 -timeout 600s ./transport/muxcool/
 printf 'series ok\n'
