@@ -1,0 +1,55 @@
+rain-core: xray/0056-muxcool-expired-write-deadline
+Source: ReClash review fix on top of xray/0050 and xray/0054 (GPL-3.0).
+
+The uncontended write fast path took the token before checking the caller's
+deadline. A deadline that had already expired then reached the physical write,
+the carrier's own write timeout fired, and the carrier was closed even though
+nothing had been written. Reject an expired deadline after taking the token,
+release it, and return os.ErrDeadlineExceeded; the carrier stays usable.
+
+Tests: TestExpiredWriteDeadlineDoesNotCloseCarrier.
+diff --git a/transport/muxcool/deadline_test.go b/transport/muxcool/deadline_test.go
+index df8846b..95cbe43 100644
+--- a/transport/muxcool/deadline_test.go
++++ b/transport/muxcool/deadline_test.go
+@@ -165,6 +165,23 @@ func TestCarrierPartialWriteClosesCarrier(t *testing.T) {
+ 	waitFor(t, func() bool { return conn.closed.Load() })
+ }
+ 
++func TestExpiredWriteDeadlineDoesNotCloseCarrier(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	worker.writeTimeout.Store(int64(30 * time.Second))
++	t.Cleanup(func() { worker.close(nil) })
++
++	if err := worker.writeFrameDeadline(Frame{SessionID: 1, Status: StatusEnd}, time.Now().Add(-time.Second)); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("expired deadline write = %v, want deadline exceeded", err)
++	}
++	if worker.closedFast.Load() {
++		t.Fatal("an expired caller deadline closed the carrier")
++	}
++	if err := worker.writeFrame(Frame{SessionID: 1, Status: StatusEnd}); err != nil {
++		t.Fatalf("carrier unusable after an expired deadline: %v", err)
++	}
++}
++
+ // partialWriteConn writes half a frame and reports an error, as a broken
+ // carrier does; the worker must close it rather than resume mid-frame.
+ type partialWriteConn struct {
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index fc6a880..338c9fd 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -260,6 +260,12 @@ func (w *carrierWorker) acquireWrite(deadline time.Time) (time.Time, error) {
+ 	// a timer per frame would cost more than the frame itself.
+ 	select {
+ 	case <-w.writeToken:
++		if !deadline.IsZero() && !time.Now().Before(deadline) {
++			// Nothing was written; an expired caller deadline must not turn
++			// into a carrier write timeout and kill the connection.
++			w.releaseWrite()
++			return deadline, os.ErrDeadlineExceeded
++		}
+ 		return deadline, nil
+ 	default:
+ 	}

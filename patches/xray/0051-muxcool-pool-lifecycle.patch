@@ -1,0 +1,614 @@
+rain-core: xray/0051-muxcool-pool-lifecycle
+Source: ReClash fix on top of xray/0037 (GPL-3.0).
+
+The shared carrier dial inherited the context of whichever caller happened to
+start it, so one request timing out aborted the carrier that every other
+waiter needed. The dial now belongs to the pool: a value-preserving context
+detached from the caller, a 30 s pool dial timeout, one dial at a time, and
+the error delivered to the waiters of that dial. Repeated failures back off
+(100 ms doubling to 2 s, the first failure retried at once) so a mass carrier
+loss does not turn every new session into another dial.
+
+The carrier limiter now registers its pools. When every slot is taken, a
+waiter asks all pools to close carriers that have been idle past a one-second
+grace, instead of waiting up to the 16 s idle timeout for the other pool to
+release a carrier; a just-freed carrier stays available for reuse in its own
+pool.
+
+Tests: TestCanceledInitiatorDoesNotAbortSharedCarrierDial,
+TestCarrierLimiterReclaimsIdleCarrierOfAnotherPool,
+TestPoolDoesNotStormCarrierDialsAfterRepeatedFailures.
+diff --git a/transport/muxcool/carrier_limiter.go b/transport/muxcool/carrier_limiter.go
+index 41394ce..16a62aa 100644
+--- a/transport/muxcool/carrier_limiter.go
++++ b/transport/muxcool/carrier_limiter.go
+@@ -6,18 +6,49 @@ import (
+ )
+ 
+ // CarrierLimiter enforces a shared upper bound on physical mux.cool carriers.
+-// A zero limit preserves the existing unlimited behavior.
++// A zero limit preserves the existing unlimited behavior. Pools that share a
++// limiter register here so a waiter can reclaim capacity from an idle carrier
++// in another pool instead of waiting for its idle timer.
+ type CarrierLimiter struct {
+ 	mu      sync.Mutex
+ 	max     int
+ 	used    int
+ 	changed chan struct{}
++	pools   map[*Pool]struct{}
+ }
+ 
+ func NewCarrierLimiter(maxCarriers int) *CarrierLimiter {
+ 	return &CarrierLimiter{
+ 		max:     maxCarriers,
+ 		changed: make(chan struct{}),
++		pools:   make(map[*Pool]struct{}),
++	}
++}
++
++func (l *CarrierLimiter) register(pool *Pool) {
++	l.mu.Lock()
++	l.pools[pool] = struct{}{}
++	l.mu.Unlock()
++}
++
++func (l *CarrierLimiter) unregister(pool *Pool) {
++	l.mu.Lock()
++	delete(l.pools, pool)
++	l.mu.Unlock()
++}
++
++// closeIdle asks every registered pool to close its carriers without
++// sessions. The snapshot is taken under the limiter lock; the pools close
++// their carriers outside it so their callbacks can re-enter the limiter.
++func (l *CarrierLimiter) closeIdle() {
++	l.mu.Lock()
++	pools := make([]*Pool, 0, len(l.pools))
++	for pool := range l.pools {
++		pools = append(pools, pool)
++	}
++	l.mu.Unlock()
++	for _, pool := range pools {
++		pool.closeIdle()
+ 	}
+ }
+ 
+diff --git a/transport/muxcool/lifecycle_test.go b/transport/muxcool/lifecycle_test.go
+new file mode 100644
+index 0000000..7dbdb6f
+--- /dev/null
++++ b/transport/muxcool/lifecycle_test.go
+@@ -0,0 +1,147 @@
++package muxcool
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// A caller whose own context expires must not abort the carrier dial that
++// other callers are still waiting on.
++func TestCanceledInitiatorDoesNotAbortSharedCarrierDial(t *testing.T) {
++	dialer := newBlockingCarrierDialer()
++	pool := NewPool(dialer.dial, testPoolOptions())
++	t.Cleanup(func() { _ = pool.Close() })
++
++	ctxA, cancelA := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer cancelA()
++	resultA := make(chan error, 1)
++	go func() {
++		_, err := pool.DialContext(ctxA, "first.example", 80)
++		resultA <- err
++	}()
++	select {
++	case <-dialer.started:
++	case <-time.After(time.Second):
++		t.Fatal("carrier dial did not start")
++	}
++	select {
++	case <-ctxA.Done():
++	case <-time.After(time.Second):
++		t.Fatal("first caller context did not expire")
++	}
++	select {
++	case err := <-resultA:
++		if !errors.Is(err, context.DeadlineExceeded) {
++			t.Fatalf("expired caller error = %v, want deadline exceeded", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("expired caller did not return")
++	}
++
++	// The second caller joins while the physical dial is still in flight.
++	resultB := make(chan net.Conn, 1)
++	errorsB := make(chan error, 1)
++	go func() {
++		conn, err := pool.DialContext(context.Background(), "second.example", 80)
++		if err != nil {
++			errorsB <- err
++			return
++		}
++		resultB <- conn
++	}()
++	time.Sleep(20 * time.Millisecond)
++
++	close(dialer.release)
++
++	select {
++	case conn := <-resultB:
++		_ = conn.Close()
++	case err := <-errorsB:
++		t.Fatalf("second caller failed: %v", err)
++	case <-time.After(time.Second):
++		t.Fatal("second caller did not open a session on the shared carrier")
++	}
++	if got := dialer.callCount(); got != 1 {
++		t.Fatalf("carrier dials = %d, want 1", got)
++	}
++}
++
++func TestCarrierLimiterReclaimsIdleCarrierOfAnotherPool(t *testing.T) {
++	previous := idleReclaimGrace
++	idleReclaimGrace = 10 * time.Millisecond
++	t.Cleanup(func() { idleReclaimGrace = previous })
++
++	dialer := &fakeCarrierDialer{}
++	limiter := NewCarrierLimiter(1)
++	options := testPoolOptions()
++	options.MaxConcurrency = 1
++	options.CarrierLimiter = limiter
++	tcpPool := NewPool(dialer.dial, options)
++	udpPool := NewPool(dialer.dial, options)
++	t.Cleanup(func() { _ = tcpPool.Close(); _ = udpPool.Close() })
++
++	stream, err := tcpPool.DialContext(context.Background(), "tcp.example", 80)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := stream.Close(); err != nil {
++		t.Fatal(err)
++	}
++	waitFor(t, func() bool { return tcpPool.activeSessions() == 0 })
++	time.Sleep(20 * time.Millisecond)
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	packetConn, err := udpPool.ListenPacketContext(ctx, "udp.example", 53, [8]byte{})
++	if err != nil {
++		t.Fatalf("UDP pool waited for the idle TCP carrier: %v", err)
++	}
++	defer packetConn.Close()
++	if got := dialer.callCount(); got != 2 {
++		t.Fatalf("carrier dials = %d, want 2", got)
++	}
++	if got := tcpPool.workerCount(); got != 0 {
++		t.Fatalf("idle TCP carriers after reclaim = %d, want 0", got)
++	}
++}
++
++func TestPoolDoesNotStormCarrierDialsAfterRepeatedFailures(t *testing.T) {
++	dialErr := errors.New("carrier unavailable")
++	var calls atomic.Int32
++	pool := NewPool(func(context.Context) (net.Conn, error) {
++		calls.Add(1)
++		return nil, dialErr
++	}, testPoolOptions())
++	t.Cleanup(func() { _ = pool.Close() })
++
++	if _, err := pool.DialContext(context.Background(), "first.example", 80); !errors.Is(err, dialErr) {
++		t.Fatalf("first dial error = %v, want %v", err, dialErr)
++	}
++
++	const callers = 32
++	var wg sync.WaitGroup
++	results := make(chan error, callers)
++	for i := 0; i < callers; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_, err := pool.DialContext(context.Background(), "storm.example", 80)
++			results <- err
++		}()
++	}
++	wg.Wait()
++	close(results)
++	for err := range results {
++		if !errors.Is(err, dialErr) {
++			t.Fatalf("storm dial error = %v, want %v", err, dialErr)
++		}
++	}
++	if got := calls.Load(); got > 2 {
++		t.Fatalf("carrier dials during a failure storm = %d, want at most 2", got)
++	}
++}
+diff --git a/transport/muxcool/pool.go b/transport/muxcool/pool.go
+index 328de49..c0bded7 100644
+--- a/transport/muxcool/pool.go
++++ b/transport/muxcool/pool.go
+@@ -22,6 +22,13 @@ const (
+ 	// one carrier. A negative value disables the cap; the per-session queue
+ 	// still bounds each session.
+ 	DefaultCarrierBufferBytes = 4 * 1024 * 1024
++	// DefaultDialTimeout bounds one physical carrier dial. The dial is owned
++	// by the pool, not by the caller that happened to start it, so a dialer
++	// that ignores cancellation cannot pin carrier creation forever.
++	DefaultDialTimeout = 30 * time.Second
++
++	dialBackoffBase = 100 * time.Millisecond
++	dialBackoffMax  = 2 * time.Second
+ )
+ 
+ var ErrPoolClosed = errors.New("mux.cool pool is closed")
+@@ -40,6 +47,7 @@ type Options struct {
+ 	FirstPayloadTimeout time.Duration
+ 	IdleTimeout         time.Duration
+ 	WriteTimeout        time.Duration
++	DialTimeout         time.Duration
+ 	AfterFunc           func(time.Duration, func()) Timer
+ }
+ 
+@@ -47,17 +55,34 @@ type Pool struct {
+ 	dial    CarrierDialer
+ 	options Options
+ 
+-	mu         sync.Mutex
+-	workers    []*carrierWorker
+-	idle       map[*carrierWorker]Timer
+-	dialing    chan struct{}
+-	dialCancel context.CancelFunc
+-	changed    chan struct{}
+-	done       chan struct{}
+-	closed     bool
+-	closeOnce  sync.Once
++	mu           sync.Mutex
++	workers      []*carrierWorker
++	idle         map[*carrierWorker]Timer
++	dialing      chan struct{}
++	dialCancel   context.CancelFunc
++	dialSeq      uint64
++	dialErr      error
++	dialErrSeq   uint64
++	dialFailures int
++	dialRetryAt  time.Time
++	changed      chan struct{}
++	done         chan struct{}
++	closed       bool
++	closeOnce    sync.Once
++}
++
++// valueOnlyContext keeps the values of a caller context (resolver initiator,
++// the mux carrier marker) without inheriting its cancellation. The carrier
++// dial belongs to the pool: one caller leaving must not abort a connection
++// that the other waiters still need.
++type valueOnlyContext struct {
++	context.Context
+ }
+ 
++func (valueOnlyContext) Deadline() (time.Time, bool) { return time.Time{}, false }
++func (valueOnlyContext) Done() <-chan struct{}       { return nil }
++func (valueOnlyContext) Err() error                  { return nil }
++
+ func NewPool(dial CarrierDialer, options Options) *Pool {
+ 	if options.MaxConcurrency == 0 {
+ 		options.MaxConcurrency = DefaultMaxConcurrency
+@@ -77,18 +102,25 @@ func NewPool(dial CarrierDialer, options Options) *Pool {
+ 	if options.WriteTimeout == 0 {
+ 		options.WriteTimeout = DefaultWriteTimeout
+ 	}
++	if options.DialTimeout == 0 {
++		options.DialTimeout = DefaultDialTimeout
++	}
+ 	if options.AfterFunc == nil {
+ 		options.AfterFunc = func(duration time.Duration, fn func()) Timer {
+ 			return time.AfterFunc(duration, fn)
+ 		}
+ 	}
+-	return &Pool{
++	pool := &Pool{
+ 		dial:    dial,
+ 		options: options,
+ 		idle:    make(map[*carrierWorker]Timer),
+ 		changed: make(chan struct{}),
+ 		done:    make(chan struct{}),
+ 	}
++	if options.CarrierLimiter != nil {
++		options.CarrierLimiter.register(pool)
++	}
++	return pool
+ }
+ 
+ func (p *Pool) DialContext(ctx context.Context, destination string, port uint16) (net.Conn, error) {
+@@ -140,10 +172,18 @@ func (p *Pool) openContext(
+ 		}
+ 
+ 		if dialing := p.dialing; dialing != nil {
++			seq := p.dialSeq
+ 			done := p.done
+ 			p.mu.Unlock()
+ 			select {
+ 			case <-dialing:
++				p.mu.Lock()
++				dialErr := p.dialErr
++				matches := p.dialErrSeq == seq
++				p.mu.Unlock()
++				if dialErr != nil && matches {
++					return openedSession{}, dialErr
++				}
+ 				continue
+ 			case <-done:
+ 				return openedSession{}, ErrPoolClosed
+@@ -160,6 +200,11 @@ func (p *Pool) openContext(
+ 				changed := p.changed
+ 				done := p.done
+ 				p.mu.Unlock()
++				// Every carrier slot is taken. An idle carrier in another
++				// pool (typically the TCP pool while XUDP waits) is useless
++				// right now; close it before sleeping on the capacity
++				// signal so the wait is not bounded by the idle timeout.
++				p.options.CarrierLimiter.closeIdle()
+ 				select {
+ 				case <-changed:
+ 					continue
+@@ -173,59 +218,94 @@ func (p *Pool) openContext(
+ 			}
+ 		}
+ 
++		if p.dialErr != nil && time.Now().Before(p.dialRetryAt) {
++			err := p.dialErr
++			p.mu.Unlock()
++			lease.release()
++			return openedSession{}, err
++		}
++
+ 		dialing := make(chan struct{})
+-		dialCtx, cancel := context.WithCancel(ctx)
++		p.dialSeq++
++		seq := p.dialSeq
++		dialCtx, cancel := context.WithTimeout(valueOnlyContext{ctx}, p.options.DialTimeout)
+ 		p.dialing = dialing
+ 		p.dialCancel = cancel
++		p.dialErr = nil
+ 		p.mu.Unlock()
+ 
+-		carrier, err := p.dial(dialCtx)
+-		cancel()
+-		if err != nil {
+-			if carrier != nil {
+-				_ = carrier.Close()
+-			}
+-			lease.release()
+-		} else if lease != nil {
+-			carrier = &limitedCarrier{Conn: carrier, lease: lease}
+-		}
++		go p.runDial(dialCtx, cancel, seq, dialing, lease)
++	}
++}
+ 
+-		p.mu.Lock()
+-		if p.dialing == dialing {
+-			p.dialing = nil
+-			p.dialCancel = nil
+-			close(dialing)
+-		}
+-		if p.closed {
+-			p.mu.Unlock()
+-			if carrier != nil {
+-				_ = carrier.Close()
+-			}
+-			return openedSession{}, ErrPoolClosed
+-		}
+-		if err != nil {
+-			p.mu.Unlock()
+-			return openedSession{}, err
+-		}
++// runDial opens one physical carrier on behalf of every caller waiting for
++// it. The dial context is bounded by the pool, not by the caller whose
++// request happened to start it; a caller that leaves simply stops waiting.
++func (p *Pool) runDial(ctx context.Context, cancel context.CancelFunc, seq uint64, dialing chan struct{}, lease *carrierLease) {
++	carrier, err := p.dial(ctx)
++	cancel()
+ 
+-		worker := newCarrierWorker(carrier, p.options.MaxConcurrency, p.options.MaxConnections, p.removeWorker)
+-		worker.maxBuffered.Store(int64(p.options.CarrierBufferBytes))
+-		worker.writeTimeout.Store(int64(p.options.WriteTimeout))
+-		worker.onIdle = p.scheduleIdle
+-		if p.options.CarrierLimiter.limited() {
+-			worker.onAvailable = p.signalAvailable
+-		}
+-		p.workers = append(p.workers, worker)
+-		conn, err := openWorkerSession(worker, ctx, destination, port, globalID, packet, p.options.FirstPayloadTimeout)
+-		if err == nil {
+-			p.mu.Unlock()
+-			return conn, nil
++	p.mu.Lock()
++	if p.dialing == dialing {
++		p.dialing = nil
++		p.dialCancel = nil
++	}
++	if err != nil {
++		p.dialErr = err
++		p.dialErrSeq = seq
++		p.dialFailures++
++		p.dialRetryAt = time.Now().Add(dialBackoff(p.dialFailures))
++		close(dialing)
++		p.mu.Unlock()
++		if carrier != nil {
++			_ = carrier.Close()
+ 		}
+-		p.removeWorkerLocked(worker)
++		lease.release()
++		return
++	}
++
++	p.dialFailures = 0
++	p.dialRetryAt = time.Time{}
++	p.dialErr = nil
++	if p.closed {
++		close(dialing)
+ 		p.mu.Unlock()
+-		worker.close(err)
+-		return openedSession{}, err
++		if carrier != nil {
++			_ = carrier.Close()
++		}
++		return
++	}
++	if lease != nil {
++		carrier = &limitedCarrier{Conn: carrier, lease: lease}
++	}
++	worker := newCarrierWorker(carrier, p.options.MaxConcurrency, p.options.MaxConnections, p.removeWorker)
++	worker.idleSince = time.Now()
++	worker.maxBuffered.Store(int64(p.options.CarrierBufferBytes))
++	worker.writeTimeout.Store(int64(p.options.WriteTimeout))
++	worker.onIdle = p.scheduleIdle
++	if p.options.CarrierLimiter.limited() {
++		worker.onAvailable = p.signalAvailable
++	}
++	p.workers = append(p.workers, worker)
++	close(dialing)
++	p.mu.Unlock()
++}
++
++// dialBackoff spaces repeated failures so a mass carrier loss does not turn
++// every new logical session into another dial. The first failure is retried
++// at once: a single transient error is common and cheap.
++func dialBackoff(failures int) time.Duration {
++	if failures < 2 {
++		return 0
++	}
++	delay := dialBackoffBase
++	for i := 2; i < failures && delay < dialBackoffMax; i++ {
++		delay *= 2
+ 	}
++	if delay > dialBackoffMax {
++		delay = dialBackoffMax
++	}
++	return delay
+ }
+ 
+ func (p *Pool) signalAvailable(*carrierWorker) {
+@@ -257,6 +337,11 @@ func openWorkerSession(
+ 	return openedSession{stream: connection}, err
+ }
+ 
++// idleReclaimGrace keeps a just-freed carrier available for reuse in its own
++// pool before another pool may reclaim its limiter slot. It is a variable
++// only so tests can shorten the wait; production reads it once per reclaim.
++var idleReclaimGrace = time.Second
++
+ func (p *Pool) scheduleIdle(worker *carrierWorker) {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+@@ -264,6 +349,7 @@ func (p *Pool) scheduleIdle(worker *carrierWorker) {
+ 		return
+ 	}
+ 	p.stopIdleLocked(worker)
++	worker.idleSince = time.Now()
+ 	p.idle[worker] = p.options.AfterFunc(p.options.IdleTimeout, func() {
+ 		p.closeIfIdle(worker)
+ 	})
+@@ -280,7 +366,36 @@ func (p *Pool) closeIfIdle(worker *carrierWorker) {
+ 	worker.close(nil)
+ }
+ 
++// closeIdle releases every carrier without sessions. The carrier limiter
++// calls it when another pool cannot acquire a slot, so capacity is reclaimed
++// from idle carriers instead of waiting for their idle timers.
++func (p *Pool) closeIdle() {
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		return
++	}
++	var idle []*carrierWorker
++	for _, worker := range p.workers {
++		if worker.activeSessions() != 0 || worker.idleSince.IsZero() {
++			continue
++		}
++		if time.Since(worker.idleSince) < idleReclaimGrace {
++			continue
++		}
++		idle = append(idle, worker)
++	}
++	for _, worker := range idle {
++		p.removeWorkerLocked(worker)
++	}
++	p.mu.Unlock()
++	for _, worker := range idle {
++		worker.close(nil)
++	}
++}
++
+ func (p *Pool) stopIdleLocked(worker *carrierWorker) {
++	worker.idleSince = time.Time{}
+ 	if timer := p.idle[worker]; timer != nil {
+ 		timer.Stop()
+ 		delete(p.idle, worker)
+@@ -314,6 +429,9 @@ func (p *Pool) containsWorkerLocked(worker *carrierWorker) bool {
+ 
+ func (p *Pool) Close() error {
+ 	p.closeOnce.Do(func() {
++		if limiter := p.options.CarrierLimiter; limiter != nil {
++			limiter.unregister(p)
++		}
+ 		p.mu.Lock()
+ 		p.closed = true
+ 		close(p.done)
+diff --git a/transport/muxcool/pool_test.go b/transport/muxcool/pool_test.go
+index c8d6e39..8ec3708 100644
+--- a/transport/muxcool/pool_test.go
++++ b/transport/muxcool/pool_test.go
+@@ -631,9 +631,9 @@ func TestPoolCloseDoesNotWaitForCarrierDial(t *testing.T) {
+ 	if err := <-dialResult; !errors.Is(err, ErrPoolClosed) {
+ 		t.Fatalf("dial error after pool close = %v, want %v", err, ErrPoolClosed)
+ 	}
+-	if !dialer.carrier.isClosed() {
+-		t.Fatal("carrier completed after pool close was not closed")
+-	}
++	// The waiter is released by Pool.Close before the dial goroutine returns;
++	// the completed carrier is closed by that goroutine.
++	waitFor(t, dialer.carrier.isClosed)
+ }
+ 
+ func TestPoolCoalescesConcurrentCarrierDials(t *testing.T) {
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index 31e0511..5904d0d 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -31,17 +31,20 @@ type carrierWorker struct {
+ 	writeTimeout atomic.Int64
+ 	buffered     atomic.Int64
+ 	maxBuffered  atomic.Int64
+-	mu           sync.Mutex
+-	sessions     map[uint16]workerSession
+-	nextID       uint32
+-	lifetime     int
+-	draining     bool
+-	closed       bool
+-	closedFast   atomic.Bool
+-	closeErr     error
+-	closeOnce    sync.Once
+-	failOnce     sync.Once
+-	closedCh     chan struct{}
++	// idleSince is guarded by the owning Pool's mu and records when the
++	// carrier last became idle for cross-pool reclaim grace.
++	idleSince  time.Time
++	mu         sync.Mutex
++	sessions   map[uint16]workerSession
++	nextID     uint32
++	lifetime   int
++	draining   bool
++	closed     bool
++	closedFast atomic.Bool
++	closeErr   error
++	closeOnce  sync.Once
++	failOnce   sync.Once
++	closedCh   chan struct{}
+ }
+ 
+ func newCarrierWorker(conn net.Conn, maxActive, maxLifetime int, onClosed func(*carrierWorker)) *carrierWorker {

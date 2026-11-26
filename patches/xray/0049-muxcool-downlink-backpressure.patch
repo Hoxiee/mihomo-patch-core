@@ -1,0 +1,978 @@
+rain-core: xray/0049-muxcool-downlink-backpressure
+Source: ReClash fix on top of xray/0037 (GPL-3.0).
+
+The carrier read loop feeds every session on one physical connection. A TCP
+consumer that stopped reading filled the 16-frame channel and blocked that
+loop, stalling all sibling sessions. Replace the channel with a byte- and
+frame-bounded queue that producers never block on: a session whose consumer
+falls 256 KiB behind is reset with ErrSessionOverflow (the caller sees the
+error; TCP data is never silently dropped or reordered), and the carrier
+keeps serving the others. UDP keeps lossy datagram semantics with its own
+byte cap and a drop counter. A carrier-wide budget bounds the sum of queued
+payload, and the queue returns pooled buffers on overflow, reset and close.
+Session End is now sent from a goroutine so a stalled carrier cannot hold
+Close or the read loop.
+
+Tests: TestSlowStreamConsumerDoesNotBlockSibling,
+TestCarrierDownlinkBudgetResetsOnlyThePushingSession,
+TestPacketSessionDeliversQueuedDatagramsBeforeRemoteEnd,
+TestPacketSessionExpiredDeadlineWinsOverQueuedData,
+TestByteQueueReleasesDroppedAndSealedItems, TestByteQueueDrainsSealedItemsBeforeClosing,
+TestPacketSessionFullQueueDoesNotBlockOtherSessions.
+
+diff --git a/transport/muxcool/backpressure_test.go b/transport/muxcool/backpressure_test.go
+new file mode 100644
+index 0000000..c48d5ee
+--- /dev/null
++++ b/transport/muxcool/backpressure_test.go
+@@ -0,0 +1,236 @@
++package muxcool
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// A TCP consumer that stops reading must not stall the carrier read loop:
++// its own bounded queue overflows, that session resets, and the siblings
++// keep receiving frames.
++func TestSlowStreamConsumerDoesNotBlockSibling(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++
++	slow, err := worker.openSession(context.Background(), "slow.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = slow.Close() })
++	fast, err := worker.openSession(context.Background(), "fast.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = fast.Close() })
++
++	payload := bytes.Repeat([]byte{0x5a}, MaxPayloadSize)
++	injected := make(chan error, 1)
++	go func() {
++		for i := 0; i < sessionDownlinkFrames*2; i++ {
++			raw, err := EncodeFrame(Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: payload})
++			if err != nil {
++				injected <- err
++				return
++			}
++			if _, err := carrier.serverWriter.Write(raw); err != nil {
++				injected <- err
++				return
++			}
++		}
++		raw, err := EncodeFrame(Frame{SessionID: 2, Status: StatusKeep, Option: OptionData, Payload: []byte("fast")})
++		if err != nil {
++			injected <- err
++			return
++		}
++		_, err = carrier.serverWriter.Write(raw)
++		injected <- err
++	}()
++
++	_ = fast.SetReadDeadline(time.Now().Add(5 * time.Second))
++	got := make([]byte, len("fast"))
++	if _, err := io.ReadFull(fast, got); err != nil {
++		t.Fatalf("sibling read while another consumer stalled: %v", err)
++	}
++	if string(got) != "fast" {
++		t.Fatalf("sibling payload = %q", got)
++	}
++	if err := <-injected; err != nil {
++		t.Fatalf("inject frames: %v", err)
++	}
++
++	_ = slow.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := slow.Read(make([]byte, 1)); !errors.Is(err, ErrSessionOverflow) {
++		t.Fatalf("slow session read error = %v, want %v", err, ErrSessionOverflow)
++	}
++	if carrier.isClosed() {
++		t.Fatal("one overflowing session closed the carrier")
++	}
++	waitFor(t, func() bool { return worker.activeSessions() == 1 })
++}
++
++func TestCarrierDownlinkBudgetResetsOnlyThePushingSession(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	worker.maxBuffered.Store(300 * 1024)
++	t.Cleanup(func() { worker.close(nil) })
++
++	first, err := worker.openSession(context.Background(), "first.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = first.Close() })
++	second, err := worker.openSession(context.Background(), "second.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = second.Close() })
++
++	// Neither consumer reads. The first session takes 200 KiB, the second
++	// one crosses the 300 KiB carrier budget and resets; the first keeps
++	// its queued data.
++	payload := bytes.Repeat([]byte{0x11}, MaxPayloadSize)
++	frames := make([]Frame, 0, 55)
++	for i := 0; i < 25; i++ {
++		frames = append(frames, Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: payload})
++	}
++	for i := 0; i < 30; i++ {
++		frames = append(frames, Frame{SessionID: 2, Status: StatusKeep, Option: OptionData, Payload: payload})
++	}
++	for _, frame := range frames {
++		carrier.inject(t, frame)
++	}
++
++	_ = second.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := second.Read(make([]byte, 1)); !errors.Is(err, ErrSessionOverflow) {
++		t.Fatalf("second session read error = %v, want %v", err, ErrSessionOverflow)
++	}
++
++	_ = first.SetReadDeadline(time.Now().Add(time.Second))
++	got := make([]byte, len(payload))
++	if _, err := io.ReadFull(first, got); err != nil {
++		t.Fatalf("first session read: %v", err)
++	}
++	if !bytes.Equal(got, payload) {
++		t.Fatal("first session payload changed")
++	}
++}
++
++func TestPacketSessionDeliversQueuedDatagramsBeforeRemoteEnd(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	packetConn, err := worker.openPacketSession("8.8.8.8", 53, [8]byte{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = packetConn.Close() })
++
++	for _, payload := range []string{"one", "two"} {
++		carrier.inject(t, Frame{
++			SessionID: 1, Status: StatusKeep, Option: OptionData, Network: NetworkUDP,
++			Destination: "1.1.1.1", Port: 53, Payload: []byte(payload),
++		})
++	}
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusEnd})
++
++	buffer := make([]byte, 8)
++	for _, want := range []string{"one", "two"} {
++		n, _, err := packetConn.ReadFrom(buffer)
++		if err != nil {
++			t.Fatalf("read %q: %v", want, err)
++		}
++		if string(buffer[:n]) != want {
++			t.Fatalf("datagram = %q, want %q", buffer[:n], want)
++		}
++	}
++	if _, _, err := packetConn.ReadFrom(buffer); !errors.Is(err, net.ErrClosed) {
++		t.Fatalf("read after End = %v, want net.ErrClosed", err)
++	}
++}
++
++func TestPacketSessionExpiredDeadlineWinsOverQueuedData(t *testing.T) {
++	owner := newFakeSessionOwner()
++	packetConn, session := newPacketSession(owner, 41, "deadline.example", 53, [8]byte{})
++	t.Cleanup(func() { _ = packetConn.Close() })
++
++	if err := session.deliverFrame(Frame{
++		SessionID: 41, Status: StatusKeep, Option: OptionData, Network: NetworkUDP,
++		Destination: "1.1.1.1", Port: 53, Payload: []byte("queued"),
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := packetConn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := packetConn.ReadFrom(make([]byte, 8)); !isTimeout(err) {
++		t.Fatalf("ReadFrom with expired deadline = %v, want timeout", err)
++	}
++	if err := packetConn.SetReadDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	buffer := make([]byte, 8)
++	n, _, err := packetConn.ReadFrom(buffer)
++	if err != nil || string(buffer[:n]) != "queued" {
++		t.Fatalf("ReadFrom after clearing deadline = (%q, %v)", buffer[:n], err)
++	}
++}
++
++func TestByteQueueReleasesDroppedAndSealedItems(t *testing.T) {
++	var released atomic.Int64
++	queue := newByteQueue(func(int) int { return 1 }, func(int) { released.Add(1) }, 2, 2)
++
++	for i := 0; i < 2; i++ {
++		if err := queue.push(i); err != nil {
++			t.Fatalf("push %d: %v", i, err)
++		}
++	}
++	if err := queue.push(2); !errors.Is(err, errQueueOverflow) {
++		t.Fatalf("push over budget = %v, want overflow", err)
++	}
++	if got := released.Load(); got != 1 {
++		t.Fatalf("released after overflow = %d, want 1", got)
++	}
++
++	dropped := queue.seal(true)
++	if len(dropped) != 2 {
++		t.Fatalf("seal returned %d items, want 2", len(dropped))
++	}
++	for _, item := range dropped {
++		_ = item
++	}
++	if err := queue.push(3); !errors.Is(err, errQueueClosed) {
++		t.Fatalf("push after seal = %v, want closed", err)
++	}
++	if got := released.Load(); got != 2 {
++		t.Fatalf("released after closed push = %d, want 2", got)
++	}
++	if _, err := queue.wait(nil); !errors.Is(err, errQueueClosed) {
++		t.Fatalf("wait on sealed queue = %v, want closed", err)
++	}
++}
++
++func TestByteQueueDrainsSealedItemsBeforeClosing(t *testing.T) {
++	queue := newByteQueue(func(int) int { return 1 }, func(int) {}, 8, 8)
++	for i := 0; i < 2; i++ {
++		if err := queue.push(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	queue.seal(false)
++	for i := 0; i < 2; i++ {
++		item, err := queue.wait(nil)
++		if err != nil || item != i {
++			t.Fatalf("wait %d = (%d, %v)", i, item, err)
++		}
++	}
++	if _, err := queue.wait(nil); !errors.Is(err, errQueueClosed) {
++		t.Fatalf("wait after drain = %v, want closed", err)
++	}
++}
+diff --git a/transport/muxcool/packet_session.go b/transport/muxcool/packet_session.go
+index 2107877..fd9ac4b 100644
+--- a/transport/muxcool/packet_session.go
++++ b/transport/muxcool/packet_session.go
+@@ -17,14 +17,31 @@ import (
+ 
+ var ErrPacketTooLarge = fmt.Errorf("mux.cool packet exceeds %d bytes", MaxPayloadSize)
+ 
++const (
++	// packetDownlinkBytes bounds the datagrams queued for one UDP consumer.
++	// One TLS record of the carrier holds about a dozen datagrams and the read
++	// loop decodes them at once, so the queue must take a burst of several
++	// records; a QUIC download treats every drop as congestion.
++	packetDownlinkBytes  = 256 * 1024
++	packetDownlinkFrames = 128
++)
++
+ type packetMessage struct {
+ 	payload []byte
+ 	addr    net.Addr
+ }
+ 
++func sizeOfPacketMessage(message packetMessage) int { return len(message.payload) }
++
++func releasePacketMessage(message packetMessage) {
++	if message.payload != nil {
++		_ = pool.Put(message.payload)
++	}
++}
++
+ func consumePacketMessage(p []byte, message packetMessage) (int, net.Addr, error) {
+ 	n := copy(p, message.payload)
+-	_ = pool.Put(message.payload)
++	releasePacketMessage(message)
+ 	return n, message.addr, nil
+ }
+ 
+@@ -35,26 +52,19 @@ type packetSession struct {
+ 	port        uint16
+ 	globalID    [8]byte
+ 
+-	writeMu sync.Mutex
+-	sentNew bool
+-
+-	input            chan packetMessage
+-	done             chan struct{}
+-	closeOnce        sync.Once
+-	closedFast       atomic.Bool
+-	causeMu          sync.Mutex
+-	cause            error
+-	readDeadline     deadline.PipeDeadline
+-	writeDeadline    deadline.PipeDeadline
+-	writeDeadlineSet atomic.Bool
++	writeMu       sync.Mutex
++	sentNew       bool
++	input         *byteQueue[packetMessage]
++	done          chan struct{}
++	closeOnce     sync.Once
++	closedFast    atomic.Bool
++	dropped       atomic.Uint64
++	causeMu       sync.Mutex
++	cause         error
++	readDeadline  deadline.PipeDeadline
++	writeDeadline deadline.PipeDeadline
+ }
+ 
+-// packetSessionQueue is how many received datagrams wait for the reader before
+-// new ones are dropped. One TLS record of the carrier holds about a dozen
+-// datagrams and the read loop decodes them at once, so the queue must take a
+-// burst of several records: a QUIC download treats every drop as congestion.
+-const packetSessionQueue = 128
+-
+ func makePacketSession(
+ 	owner sessionOwner,
+ 	id uint16,
+@@ -62,18 +72,22 @@ func makePacketSession(
+ 	port uint16,
+ 	globalID [8]byte,
+ ) *packetSession {
+-	s := &packetSession{
++	queue := newByteQueue(sizeOfPacketMessage, releasePacketMessage, packetDownlinkBytes, packetDownlinkFrames)
++	if budget, ok := owner.(downlinkBudget); ok {
++		queue.charge = budget.chargeDownlink
++		queue.credit = budget.creditDownlink
++	}
++	return &packetSession{
+ 		owner:         owner,
+ 		id:            id,
+ 		destination:   destination,
+ 		port:          port,
+ 		globalID:      globalID,
+-		input:         make(chan packetMessage, packetSessionQueue),
++		input:         queue,
+ 		done:          make(chan struct{}),
+ 		readDeadline:  deadline.MakePipeDeadline(),
+ 		writeDeadline: deadline.MakePipeDeadline(),
+ 	}
+-	return s
+ }
+ 
+ func (s *packetSession) ReadFrom(p []byte) (int, net.Addr, error) {
+@@ -91,35 +105,20 @@ func (s *packetSession) WaitReadFrom() ([]byte, func(), net.Addr, error) {
+ 	}
+ 	payload := message.payload
+ 	put := func() {
+-		_ = pool.Put(payload)
++		releasePacketMessage(packetMessage{payload: payload})
+ 	}
+ 	return payload, put, message.addr, nil
+ }
+ 
+ func (s *packetSession) readPacketMessage() (packetMessage, error) {
+-	if message, ok := s.nextQueued(); ok {
+-		return message, nil
+-	}
+-	select {
+-	case message := <-s.input:
+-		return message, nil
+-	case <-s.done:
+-		if message, ok := s.nextQueued(); ok {
+-			return message, nil
+-		}
+-		return packetMessage{}, s.terminalCause()
+-	case <-s.readDeadline.Wait():
++	if deadlineExpired(&s.readDeadline) {
+ 		return packetMessage{}, os.ErrDeadlineExceeded
+ 	}
+-}
+-
+-func (s *packetSession) nextQueued() (packetMessage, bool) {
+-	select {
+-	case message := <-s.input:
+-		return message, true
+-	default:
+-		return packetMessage{}, false
++	message, err := s.input.wait(&s.readDeadline)
++	if errors.Is(err, errQueueClosed) {
++		return packetMessage{}, s.terminalCause()
+ 	}
++	return message, err
+ }
+ 
+ func (s *packetSession) WriteTo(payload []byte, addr net.Addr) (int, error) {
+@@ -139,13 +138,9 @@ func (s *packetSession) WriteTo(payload []byte, addr net.Addr) (int, error) {
+ 		s.writeMu.Unlock()
+ 		return 0, s.terminalCause()
+ 	}
+-	if s.writeDeadlineSet.Load() {
+-		select {
+-		case <-s.writeDeadline.Wait():
+-			s.writeMu.Unlock()
+-			return 0, os.ErrDeadlineExceeded
+-		default:
+-		}
++	if deadlineExpired(&s.writeDeadline) {
++		s.writeMu.Unlock()
++		return 0, os.ErrDeadlineExceeded
+ 	}
+ 
+ 	frame := Frame{
+@@ -197,13 +192,7 @@ func (s *packetSession) SetReadDeadline(t time.Time) error {
+ }
+ 
+ func (s *packetSession) SetWriteDeadline(t time.Time) error {
+-	if !t.IsZero() {
+-		s.writeDeadlineSet.Store(true)
+-	}
+ 	s.writeDeadline.Set(t)
+-	if t.IsZero() {
+-		s.writeDeadlineSet.Store(false)
+-	}
+ 	return nil
+ }
+ 
+@@ -225,16 +214,16 @@ func (s *packetSession) deliverDecodedFrame(decoded decodedFrame) error {
+ 			decoded.releasePayload()
+ 			return protocolError("deliver UDP", err)
+ 		}
+-		select {
+-		case s.input <- packetMessage{payload: frame.Payload, addr: addr}:
+-		case <-s.done:
+-			decoded.releasePayload()
+-			return net.ErrClosed
+-		default:
+-			// UDP is lossy: drop the datagram instead of stalling the
+-			// carrier read loop, which feeds every session on this
+-			// connection, as the server side does.
+-			decoded.releasePayload()
++		message := packetMessage{payload: frame.Payload, addr: addr}
++		if pushErr := s.input.push(message); pushErr != nil {
++			if errors.Is(pushErr, errQueueOverflow) {
++				// UDP is lossy: drop the datagram instead of stalling the
++				// carrier read loop, which feeds every session on this
++				// connection, as the server side does.
++				s.dropped.Add(1)
++			} else {
++				return net.ErrClosed
++			}
+ 		}
+ 	} else {
+ 		decoded.releasePayload()
+@@ -265,17 +254,32 @@ func (s *packetSession) closeCarrier(cause error) {
+ 
+ func (s *packetSession) finish(cause error, sendEnd bool) {
+ 	s.closeOnce.Do(func() {
+-		s.writeMu.Lock()
+-		if sendEnd {
+-			_ = s.owner.writeFrame(Frame{SessionID: s.id, Status: StatusEnd})
+-		}
+ 		s.causeMu.Lock()
+ 		s.cause = cause
+ 		s.causeMu.Unlock()
++		// A clean remote End keeps queued datagrams for the reader to drain;
++		// a reset drops them.
++		dropped := s.input.seal(cause != nil || sendEnd)
++		for index := range dropped {
++			releasePacketMessage(dropped[index])
++		}
+ 		s.closedFast.Store(true)
+ 		close(s.done)
+-		s.writeMu.Unlock()
+-		s.owner.removeSession(s.id)
++		s.readDeadline.Set(time.Time{})
++		s.writeDeadline.Set(time.Time{})
++		if !sendEnd {
++			s.owner.removeSession(s.id)
++			return
++		}
++		// End is ordered after an in-flight WriteTo by writeMu, but Close
++		// itself must not wait for the carrier: the write timeout bounds the
++		// goroutine and the read loop is never involved.
++		go func() {
++			s.writeMu.Lock()
++			_ = s.owner.writeFrame(Frame{SessionID: s.id, Status: StatusEnd})
++			s.writeMu.Unlock()
++			s.owner.removeSession(s.id)
++		}()
+ 	})
+ }
+ 
+diff --git a/transport/muxcool/packet_session_test.go b/transport/muxcool/packet_session_test.go
+index 1589613..a000b07 100644
+--- a/transport/muxcool/packet_session_test.go
++++ b/transport/muxcool/packet_session_test.go
+@@ -177,7 +177,7 @@ func TestPacketSessionFullQueueDoesNotBlockOtherSessions(t *testing.T) {
+ 	}
+ 	t.Cleanup(func() { _ = stream.Close(); _ = packetConn.Close() })
+ 
+-	queue := cap(packetConn.(*packetSession).input)
++	queue := packetDownlinkFrames
+ 	frames := make([][]byte, 0, queue*2+2)
+ 	for i := 0; i < queue*2; i++ {
+ 		raw, err := EncodeFrame(Frame{
+diff --git a/transport/muxcool/pool.go b/transport/muxcool/pool.go
+index 19efa39..23ed06f 100644
+--- a/transport/muxcool/pool.go
++++ b/transport/muxcool/pool.go
+@@ -13,6 +13,10 @@ const (
+ 	DefaultMaxConnections      = 128
+ 	DefaultFirstPayloadTimeout = 100 * time.Millisecond
+ 	DefaultIdleTimeout         = 16 * time.Second
++	// DefaultCarrierBufferBytes caps payload queued across all sessions of
++	// one carrier. A negative value disables the cap; the per-session queue
++	// still bounds each session.
++	DefaultCarrierBufferBytes = 4 * 1024 * 1024
+ )
+ 
+ var ErrPoolClosed = errors.New("mux.cool pool is closed")
+@@ -27,6 +31,7 @@ type Options struct {
+ 	MaxConcurrency      int
+ 	MaxConnections      int
+ 	CarrierLimiter      *CarrierLimiter
++	CarrierBufferBytes  int
+ 	FirstPayloadTimeout time.Duration
+ 	IdleTimeout         time.Duration
+ 	AfterFunc           func(time.Duration, func()) Timer
+@@ -60,6 +65,9 @@ func NewPool(dial CarrierDialer, options Options) *Pool {
+ 	if options.IdleTimeout == 0 {
+ 		options.IdleTimeout = DefaultIdleTimeout
+ 	}
++	if options.CarrierBufferBytes == 0 {
++		options.CarrierBufferBytes = DefaultCarrierBufferBytes
++	}
+ 	if options.AfterFunc == nil {
+ 		options.AfterFunc = func(duration time.Duration, fn func()) Timer {
+ 			return time.AfterFunc(duration, fn)
+@@ -192,6 +200,7 @@ func (p *Pool) openContext(
+ 		}
+ 
+ 		worker := newCarrierWorker(carrier, p.options.MaxConcurrency, p.options.MaxConnections, p.removeWorker)
++		worker.maxBuffered.Store(int64(p.options.CarrierBufferBytes))
+ 		worker.onIdle = p.scheduleIdle
+ 		if p.options.CarrierLimiter.limited() {
+ 			worker.onAvailable = p.signalAvailable
+diff --git a/transport/muxcool/queue.go b/transport/muxcool/queue.go
+new file mode 100644
+index 0000000..717dbeb
+--- /dev/null
++++ b/transport/muxcool/queue.go
+@@ -0,0 +1,181 @@
++package muxcool
++
++import (
++	"errors"
++	"os"
++	"sync"
++
++	"github.com/metacubex/mihomo/common/net/deadline"
++)
++
++// errQueueClosed means the session ended and nothing is left to drain.
++var errQueueClosed = errors.New("mux.cool session queue is closed")
++
++// errQueueOverflow means the session's consumer fell too far behind. The
++// carrier read loop feeds every session on one physical connection, so it
++// must never wait on a single consumer: the caller turns an overflow into a
++// session reset instead of stalling the siblings.
++var errQueueOverflow = errors.New("mux.cool session queue is full")
++
++// byteQueue is a bounded FIFO between the carrier read loop and one session
++// consumer. Producers never block; the byte budget is the real limit and the
++// item count bounds per-item overhead. Ownership of an item passes to the
++// queue on a successful push and back to the consumer on pop or seal.
++type byteQueue[T any] struct {
++	mu       sync.Mutex
++	items    []T
++	bytes    int
++	closed   bool
++	notify   chan struct{}
++	maxBytes int
++	maxItems int
++	sizeOf   func(T) int
++	release  func(T)
++	charge   func(int) bool
++	credit   func(int)
++}
++
++func newByteQueue[T any](
++	sizeOf func(T) int,
++	release func(T),
++	maxBytes, maxItems int,
++) *byteQueue[T] {
++	return &byteQueue[T]{
++		notify:   make(chan struct{}),
++		maxBytes: maxBytes,
++		maxItems: maxItems,
++		sizeOf:   sizeOf,
++		release:  release,
++	}
++}
++
++// push appends item without waiting. It reports errQueueClosed when the
++// session ended, and errQueueOverflow when the item would exceed either
++// bound or the carrier-wide budget; in both cases item has been released.
++func (q *byteQueue[T]) push(item T) error {
++	size := q.sizeOf(item)
++	q.mu.Lock()
++	if q.closed {
++		q.mu.Unlock()
++		q.release(item)
++		return errQueueClosed
++	}
++	if q.maxItems > 0 && len(q.items) >= q.maxItems {
++		q.mu.Unlock()
++		q.release(item)
++		return errQueueOverflow
++	}
++	if q.maxBytes > 0 && q.bytes+size > q.maxBytes {
++		q.mu.Unlock()
++		q.release(item)
++		return errQueueOverflow
++	}
++	if q.charge != nil && size > 0 && !q.charge(size) {
++		q.mu.Unlock()
++		q.release(item)
++		return errQueueOverflow
++	}
++	q.items = append(q.items, item)
++	q.bytes += size
++	signal := q.notify
++	q.notify = make(chan struct{})
++	q.mu.Unlock()
++	close(signal)
++	return nil
++}
++
++func (q *byteQueue[T]) popLocked() (T, bool) {
++	if len(q.items) == 0 {
++		var zero T
++		return zero, false
++	}
++	item := q.items[0]
++	var zero T
++	q.items[0] = zero
++	q.items = q.items[1:]
++	size := q.sizeOf(item)
++	q.bytes -= size
++	if q.credit != nil && size > 0 {
++		q.credit(size)
++	}
++	return item, true
++}
++
++func (q *byteQueue[T]) pop() (T, bool) {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	return q.popLocked()
++}
++
++// wait returns the next item, blocking until one is queued, the queue is
++// sealed and drained (errQueueClosed), or the deadline fires. A queued item
++// is delivered even when the deadline has already passed, matching a network
++// read that started before the deadline.
++func (q *byteQueue[T]) wait(d *deadline.PipeDeadline) (T, error) {
++	for {
++		q.mu.Lock()
++		if item, ok := q.popLocked(); ok {
++			q.mu.Unlock()
++			return item, nil
++		}
++		if q.closed {
++			q.mu.Unlock()
++			var zero T
++			return zero, errQueueClosed
++		}
++		notify := q.notify
++		q.mu.Unlock()
++
++		if d == nil {
++			<-notify
++			continue
++		}
++		select {
++		case <-notify:
++		case <-d.Wait():
++			var zero T
++			return zero, os.ErrDeadlineExceeded
++		}
++	}
++}
++
++// seal stops new pushes and wakes waiters. With drop, queued items are
++// returned for the caller to release; without it they stay for the consumer
++// to drain before errQueueClosed.
++func (q *byteQueue[T]) seal(drop bool) []T {
++	q.mu.Lock()
++	if q.closed {
++		q.mu.Unlock()
++		return nil
++	}
++	q.closed = true
++	var dropped []T
++	if drop {
++		dropped = q.items
++		q.items = nil
++		if q.credit != nil && q.bytes > 0 {
++			q.credit(q.bytes)
++		}
++		q.bytes = 0
++	}
++	signal := q.notify
++	q.notify = make(chan struct{})
++	q.mu.Unlock()
++	close(signal)
++	return dropped
++}
++
++func deadlineExpired(d *deadline.PipeDeadline) bool {
++	select {
++	case <-d.Wait():
++		return true
++	default:
++		return false
++	}
++}
++
++func (q *byteQueue[T]) stats() (items, bytes int) {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	return len(q.items), q.bytes
++}
+diff --git a/transport/muxcool/session.go b/transport/muxcool/session.go
+index 50d6702..6e242f2 100644
+--- a/transport/muxcool/session.go
++++ b/transport/muxcool/session.go
+@@ -9,6 +9,21 @@ import (
+ 	"time"
+ )
+ 
++// ErrSessionOverflow reports a logical session whose consumer fell further
++// behind than its bounded downlink buffer allows. The session is reset so a
++// stalled consumer cannot stall the other sessions sharing its carrier; the
++// caller observes this error instead of silently missing TCP data.
++var ErrSessionOverflow = errors.New("mux.cool session downlink buffer overflow")
++
++const (
++	// sessionDownlinkBytes bounds the payload queued for one TCP consumer.
++	// It is a policy limit, not a throughput target: a healthy reader keeps
++	// the queue near empty, and 256 KiB absorbs a burst on a mobile link.
++	sessionDownlinkBytes = 256 * 1024
++	// sessionDownlinkFrames bounds the per-frame overhead at the same time.
++	sessionDownlinkFrames = 128
++)
++
+ type sessionOwner interface {
+ 	// writeFrame consumes frame and its payload before returning.
+ 	writeFrame(Frame) error
+@@ -20,6 +35,14 @@ type workerSession interface {
+ 	closeCarrier(error)
+ }
+ 
++// downlinkBudget is the carrier-wide cap on payload queued across all its
++// sessions. An owner that does not implement it keeps only the per-session
++// bound, which is what the transport tests use.
++type downlinkBudget interface {
++	chargeDownlink(int) bool
++	creditDownlink(int)
++}
++
+ // logicalConn is the caller-facing half of a logical Mux stream. net.Pipe gives
+ // each direction independent buffering and deadline state while the session
+ // goroutines translate the other half to and from mux.cool frames.
+@@ -75,7 +98,7 @@ type session struct {
+ 	port        uint16
+ 	peer        net.Conn
+ 	client      net.Conn
+-	downlink    chan downlinkMessage
++	downlink    *byteQueue[downlinkMessage]
+ 	done        chan struct{}
+ 	closeOnce   sync.Once
+ 	causeMu     sync.Mutex
+@@ -95,6 +118,19 @@ func (m *downlinkMessage) releasePayload() {
+ 	m.payloadPooled = false
+ }
+ 
++func sizeOfDownlinkMessage(message downlinkMessage) int { return len(message.payload) }
++
++func releaseDownlinkMessage(message downlinkMessage) { message.releasePayload() }
++
++func newDownlinkQueue(owner sessionOwner) *byteQueue[downlinkMessage] {
++	queue := newByteQueue(sizeOfDownlinkMessage, releaseDownlinkMessage, sessionDownlinkBytes, sessionDownlinkFrames)
++	if budget, ok := owner.(downlinkBudget); ok {
++		queue.charge = budget.chargeDownlink
++		queue.credit = budget.creditDownlink
++	}
++	return queue
++}
++
+ var sessionBufferPool = sync.Pool{
+ 	New: func() any { return new([MaxPayloadSize]byte) },
+ }
+@@ -108,7 +144,7 @@ func makeSession(owner sessionOwner, id uint16, destination string, port uint16)
+ 		port:        port,
+ 		peer:        peer,
+ 		client:      client,
+-		downlink:    make(chan downlinkMessage, 16),
++		downlink:    newDownlinkQueue(owner),
+ 		done:        make(chan struct{}),
+ 	}
+ 	logical := &logicalConn{
+@@ -183,19 +219,18 @@ func (s *session) runUplink(firstPayloadTimeout time.Duration) {
+ 
+ func (s *session) runDownlink() {
+ 	for {
+-		select {
+-		case message := <-s.downlink:
+-			err := writeFull(s.peer, message.payload)
+-			message.releasePayload()
+-			if err != nil {
+-				s.finish(nil, true)
+-				return
+-			}
+-			if message.terminal {
+-				s.finish(message.cause, false)
+-				return
+-			}
+-		case <-s.done:
++		message, err := s.downlink.wait(nil)
++		if err != nil {
++			return
++		}
++		writeErr := writeFull(s.peer, message.payload)
++		message.releasePayload()
++		if writeErr != nil {
++			s.finish(nil, true)
++			return
++		}
++		if message.terminal {
++			s.finish(message.cause, false)
+ 			return
+ 		}
+ 	}
+@@ -204,31 +239,35 @@ func (s *session) runDownlink() {
+ func (s *session) deliverDecodedFrame(decoded decodedFrame) error {
+ 	frame := decoded.Frame
+ 	terminal := frame.Status == StatusEnd || frame.Option&OptionError != 0
++	if frame.Option&OptionData == 0 && !terminal {
++		decoded.releasePayload()
++		return nil
++	}
+ 	message := downlinkMessage{payload: frame.Payload, payloadPooled: decoded.payloadPooled}
+ 	if terminal {
+-		var cause error
+ 		if frame.Option&OptionError != 0 {
+-			cause = protocolError("remote session", errors.New("remote reported an error"))
++			message.cause = protocolError("remote session", errors.New("remote reported an error"))
+ 		}
+ 		message.terminal = true
+-		message.cause = cause
+-		return s.enqueueDownlink(message)
+ 	}
+-	if frame.Option&OptionData != 0 {
+-		return s.enqueueDownlink(message)
+-	}
+-	decoded.releasePayload()
+-	return nil
++	return s.enqueueDownlink(message)
+ }
+ 
+ func (s *session) enqueueDownlink(message downlinkMessage) error {
+-	select {
+-	case s.downlink <- message:
++	err := s.downlink.push(message)
++	if errors.Is(err, errQueueOverflow) {
++		// The queue released the message. Reset this session only: the read
++		// loop must keep serving the other sessions on the carrier.
++		s.finish(ErrSessionOverflow, true)
+ 		return nil
+-	case <-s.done:
+-		message.releasePayload()
++	}
++	if errors.Is(err, errQueueClosed) {
++		// The session finished between the read loop's lookup and this push.
++		// The frame is released; net.ErrClosed tells the loop not to treat
++		// the race as a carrier failure.
+ 		return net.ErrClosed
+ 	}
++	return err
+ }
+ 
+ func (s *session) closeCarrier(cause error) {
+@@ -240,8 +279,9 @@ func (s *session) finish(cause error, sendEnd bool) {
+ 		s.causeMu.Lock()
+ 		s.cause = cause
+ 		s.causeMu.Unlock()
+-		if sendEnd {
+-			_ = s.owner.writeFrame(Frame{SessionID: s.id, Status: StatusEnd})
++		dropped := s.downlink.seal(cause != nil || sendEnd)
++		for index := range dropped {
++			dropped[index].releasePayload()
+ 		}
+ 		close(s.done)
+ 		_ = s.peer.Close()
+@@ -251,7 +291,16 @@ func (s *session) finish(cause error, sendEnd bool) {
+ 		if cause != nil || sendEnd {
+ 			_ = s.client.Close()
+ 		}
+-		s.owner.removeSession(s.id)
++		if !sendEnd {
++			s.owner.removeSession(s.id)
++			return
++		}
++		// A carrier that stopped reading must not hold Close for longer than
++		// its write timeout, and the read loop must not wait for this End.
++		go func() {
++			_ = s.owner.writeFrame(Frame{SessionID: s.id, Status: StatusEnd})
++			s.owner.removeSession(s.id)
++		}()
+ 	})
+ }
+ 
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index a42562f..427bdbb 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -21,6 +21,8 @@ type carrierWorker struct {
+ 
+ 	writeMu     sync.Mutex
+ 	writeBuffer []byte
++	buffered    atomic.Int64
++	maxBuffered atomic.Int64
+ 	mu          sync.Mutex
+ 	sessions    map[uint16]workerSession
+ 	nextID      uint32
+@@ -112,6 +114,29 @@ func (w *carrierWorker) activeSessions() int {
+ 	return len(w.sessions)
+ }
+ 
++// chargeDownlink reserves n bytes of the carrier-wide downlink budget. A
++// zero budget disables the cap; the per-session queue still bounds each
++// session.
++func (w *carrierWorker) chargeDownlink(n int) bool {
++	limit := w.maxBuffered.Load()
++	if limit <= 0 {
++		return true
++	}
++	total := w.buffered.Add(int64(n))
++	if total > limit {
++		w.buffered.Add(-int64(n))
++		return false
++	}
++	return true
++}
++
++func (w *carrierWorker) creditDownlink(n int) {
++	if w.maxBuffered.Load() <= 0 || n <= 0 {
++		return
++	}
++	w.buffered.Add(-int64(n))
++}
++
+ func (w *carrierWorker) writeFrame(frame Frame) error {
+ 	w.writeMu.Lock()
+ 	raw, err := encodeFrame(w.writeBuffer, frame)

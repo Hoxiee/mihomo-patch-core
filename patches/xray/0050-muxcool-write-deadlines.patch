@@ -1,0 +1,546 @@
+rain-core: xray/0050-muxcool-write-deadlines
+Source: ReClash fix on top of xray/0037 (GPL-3.0).
+
+A peer that stopped reading could pin the carrier write turn forever: every
+session queued behind writeMu, and Close waited on an End frame behind the
+same turn. Serialize frames with a token that a caller can wait on with its
+own deadline, and bound one whole frame write with a 30 s carrier timeout
+(options.write-timeout is not exposed; the pool default applies). A timeout
+while waiting for the turn writes nothing and leaves the carrier usable; a
+timeout inside the physical write closes the carrier because the frame may be
+partial. packetSession.WriteTo now carries its deadline through the turn wait
+and the physical write, and reports os.ErrDeadlineExceeded without killing the
+carrier when nothing was written.
+
+Tests: TestCarrierWriteTimeoutClosesStalledCarrier,
+TestPacketWriteDeadlineBoundsCarrierTurnWait,
+TestPacketWriteDeadlineDuringPhysicalWriteClosesCarrier,
+TestCarrierPartialWriteClosesCarrier.
+
+diff --git a/transport/muxcool/deadline_test.go b/transport/muxcool/deadline_test.go
+new file mode 100644
+index 0000000..df8846b
+--- /dev/null
++++ b/transport/muxcool/deadline_test.go
+@@ -0,0 +1,206 @@
++package muxcool
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"os"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// writeSignalConn reports the first physical write so a test can wait until
++// a frame is actually in flight.
++type writeSignalConn struct {
++	net.Conn
++	once    sync.Once
++	entered chan struct{}
++}
++
++func (c *writeSignalConn) Write(p []byte) (int, error) {
++	c.once.Do(func() { close(c.entered) })
++	return c.Conn.Write(p)
++}
++
++func TestCarrierWriteTimeoutClosesStalledCarrier(t *testing.T) {
++	client, server := net.Pipe()
++	t.Cleanup(func() { _ = server.Close() })
++	carrier := &writeSignalConn{Conn: client, entered: make(chan struct{})}
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	worker.writeTimeout.Store(int64(20 * time.Millisecond))
++	t.Cleanup(func() { worker.close(nil) })
++
++	conn, err := worker.openSession(context.Background(), "stalled.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++
++	writeDone := make(chan error, 1)
++	go func() {
++		_, err := conn.Write([]byte("payload"))
++		writeDone <- err
++	}()
++	select {
++	case <-carrier.entered:
++	case <-time.After(time.Second):
++		t.Fatal("carrier write did not start")
++	}
++
++	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++	start := time.Now()
++	_, err = conn.Read(make([]byte, 1))
++	if !errors.Is(err, ErrCarrierWriteTimeout) {
++		t.Fatalf("read error = %v, want %v", err, ErrCarrierWriteTimeout)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("carrier timeout took %v", elapsed)
++	}
++	select {
++	case <-writeDone:
++	case <-time.After(time.Second):
++		t.Fatal("uplink write did not return after the carrier failed")
++	}
++}
++
++func TestPacketWriteDeadlineBoundsCarrierTurnWait(t *testing.T) {
++	client, server := net.Pipe()
++	t.Cleanup(func() { _ = server.Close() })
++	carrier := &writeSignalConn{Conn: client, entered: make(chan struct{})}
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	worker.writeTimeout.Store(int64(5 * time.Second))
++	t.Cleanup(func() { worker.close(nil) })
++
++	blocking, err := worker.openPacketSession("a.example", 53, [8]byte{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = blocking.Close() })
++	waiting, err := worker.openPacketSession("b.example", 53, [8]byte{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = waiting.Close() })
++
++	target := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("1.1.1.1:53"))
++	firstDone := make(chan error, 1)
++	go func() {
++		_, err := blocking.WriteTo([]byte("first"), target)
++		firstDone <- err
++	}()
++	select {
++	case <-carrier.entered:
++	case <-time.After(time.Second):
++		t.Fatal("first packet write did not reach the carrier")
++	}
++
++	if err := waiting.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	start := time.Now()
++	if _, err := waiting.WriteTo([]byte("second"), target); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("WriteTo while carrier turn is held = %v, want deadline exceeded", err)
++	}
++	if elapsed := time.Since(start); elapsed > time.Second {
++		t.Fatalf("deadline wait took %v", elapsed)
++	}
++	if worker.closedFast.Load() {
++		t.Fatal("a deadline while waiting for the write turn closed the carrier")
++	}
++
++	worker.close(nil)
++	select {
++	case <-firstDone:
++	case <-time.After(time.Second):
++		t.Fatal("first packet write did not unblock on carrier close")
++	}
++}
++
++func TestPacketWriteDeadlineDuringPhysicalWriteClosesCarrier(t *testing.T) {
++	client, server := net.Pipe()
++	t.Cleanup(func() { _ = server.Close() })
++	carrier := &writeSignalConn{Conn: client, entered: make(chan struct{})}
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	worker.writeTimeout.Store(int64(5 * time.Second))
++	t.Cleanup(func() { worker.close(nil) })
++
++	packetConn, err := worker.openPacketSession("deadline.example", 53, [8]byte{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = packetConn.Close() })
++
++	target := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("1.1.1.1:53"))
++	if err := packetConn.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := packetConn.WriteTo([]byte("stalled"), target); !errors.Is(err, ErrCarrierWriteTimeout) {
++		t.Fatalf("WriteTo = %v, want %v", err, ErrCarrierWriteTimeout)
++	}
++	waitFor(t, func() bool { return worker.closedFast.Load() })
++}
++
++func TestCarrierPartialWriteClosesCarrier(t *testing.T) {
++	writeErr := errors.New("short write")
++	conn := newPartialWriteConn(writeErr)
++	worker := newCarrierWorker(conn, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++
++	stream, err := worker.openSession(context.Background(), "partial.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = stream.Close() })
++
++	if _, err := stream.Write([]byte("payload")); err != nil {
++		t.Fatalf("stream write: %v", err)
++	}
++	_ = stream.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, writeErr) {
++		t.Fatalf("read error = %v, want %v", err, writeErr)
++	}
++	waitFor(t, func() bool { return conn.closed.Load() })
++}
++
++// partialWriteConn writes half a frame and reports an error, as a broken
++// carrier does; the worker must close it rather than resume mid-frame.
++type partialWriteConn struct {
++	writeErr error
++	closed   atomic.Bool
++	done     chan struct{}
++	once     sync.Once
++}
++
++func newPartialWriteConn(writeErr error) *partialWriteConn {
++	return &partialWriteConn{writeErr: writeErr, done: make(chan struct{})}
++}
++
++func (c *partialWriteConn) Read([]byte) (int, error) {
++	<-c.done
++	return 0, net.ErrClosed
++}
++
++func (c *partialWriteConn) Write(p []byte) (int, error) {
++	n := len(p) / 2
++	if n == 0 {
++		n = 1
++	}
++	return n, c.writeErr
++}
++
++func (c *partialWriteConn) Close() error {
++	c.once.Do(func() {
++		c.closed.Store(true)
++		close(c.done)
++	})
++	return nil
++}
++
++func (c *partialWriteConn) LocalAddr() net.Addr              { return muxAddr("partial") }
++func (c *partialWriteConn) RemoteAddr() net.Addr             { return muxAddr("partial") }
++func (c *partialWriteConn) SetDeadline(time.Time) error      { return nil }
++func (c *partialWriteConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *partialWriteConn) SetWriteDeadline(time.Time) error { return nil }
+diff --git a/transport/muxcool/packet_session.go b/transport/muxcool/packet_session.go
+index fd9ac4b..a72c141 100644
+--- a/transport/muxcool/packet_session.go
++++ b/transport/muxcool/packet_session.go
+@@ -63,6 +63,7 @@ type packetSession struct {
+ 	cause         error
+ 	readDeadline  deadline.PipeDeadline
+ 	writeDeadline deadline.PipeDeadline
++	writeAt       atomic.Int64
+ }
+ 
+ func makePacketSession(
+@@ -160,12 +161,18 @@ func (s *packetSession) WriteTo(payload []byte, addr net.Addr) (int, error) {
+ 		frame.Port = s.port
+ 		frame.GlobalID = s.globalID
+ 	}
+-	err = s.owner.writeFrame(frame)
++	err = writeFrameWithDeadline(s.owner, frame, s.writeDeadlineTime())
+ 	if err == nil {
+ 		s.sentNew = true
+ 	}
+ 	s.writeMu.Unlock()
+ 	if err != nil {
++		// A deadline that expired while waiting for the carrier write turn
++		// wrote nothing and leaves the session usable; a timeout inside the
++		// physical write closes the carrier and its sessions separately.
++		if errors.Is(err, os.ErrDeadlineExceeded) {
++			return 0, err
++		}
+ 		s.finish(err, false)
+ 		return 0, err
+ 	}
+@@ -193,9 +200,21 @@ func (s *packetSession) SetReadDeadline(t time.Time) error {
+ 
+ func (s *packetSession) SetWriteDeadline(t time.Time) error {
+ 	s.writeDeadline.Set(t)
++	if t.IsZero() {
++		s.writeAt.Store(0)
++	} else {
++		s.writeAt.Store(t.UnixNano())
++	}
+ 	return nil
+ }
+ 
++func (s *packetSession) writeDeadlineTime() time.Time {
++	if at := s.writeAt.Load(); at != 0 {
++		return time.Unix(0, at)
++	}
++	return time.Time{}
++}
++
+ func (s *packetSession) deliverDecodedFrame(decoded decodedFrame) error {
+ 	frame := decoded.Frame
+ 	if frame.Option&OptionData != 0 {
+diff --git a/transport/muxcool/pool.go b/transport/muxcool/pool.go
+index 23ed06f..328de49 100644
+--- a/transport/muxcool/pool.go
++++ b/transport/muxcool/pool.go
+@@ -13,6 +13,11 @@ const (
+ 	DefaultMaxConnections      = 128
+ 	DefaultFirstPayloadTimeout = 100 * time.Millisecond
+ 	DefaultIdleTimeout         = 16 * time.Second
++	// DefaultWriteTimeout bounds one whole frame write on a carrier. A peer
++	// that stops reading must fail the carrier instead of pinning every
++	// session behind the write turn; 8 KiB frames never need 30 s on a
++	// working link, and a mobile uplink can be slow without being dead.
++	DefaultWriteTimeout = 30 * time.Second
+ 	// DefaultCarrierBufferBytes caps payload queued across all sessions of
+ 	// one carrier. A negative value disables the cap; the per-session queue
+ 	// still bounds each session.
+@@ -34,6 +39,7 @@ type Options struct {
+ 	CarrierBufferBytes  int
+ 	FirstPayloadTimeout time.Duration
+ 	IdleTimeout         time.Duration
++	WriteTimeout        time.Duration
+ 	AfterFunc           func(time.Duration, func()) Timer
+ }
+ 
+@@ -68,6 +74,9 @@ func NewPool(dial CarrierDialer, options Options) *Pool {
+ 	if options.CarrierBufferBytes == 0 {
+ 		options.CarrierBufferBytes = DefaultCarrierBufferBytes
+ 	}
++	if options.WriteTimeout == 0 {
++		options.WriteTimeout = DefaultWriteTimeout
++	}
+ 	if options.AfterFunc == nil {
+ 		options.AfterFunc = func(duration time.Duration, fn func()) Timer {
+ 			return time.AfterFunc(duration, fn)
+@@ -201,6 +210,7 @@ func (p *Pool) openContext(
+ 
+ 		worker := newCarrierWorker(carrier, p.options.MaxConcurrency, p.options.MaxConnections, p.removeWorker)
+ 		worker.maxBuffered.Store(int64(p.options.CarrierBufferBytes))
++		worker.writeTimeout.Store(int64(p.options.WriteTimeout))
+ 		worker.onIdle = p.scheduleIdle
+ 		if p.options.CarrierLimiter.limited() {
+ 			worker.onAvailable = p.signalAvailable
+diff --git a/transport/muxcool/session.go b/transport/muxcool/session.go
+index 6e242f2..b804f0d 100644
+--- a/transport/muxcool/session.go
++++ b/transport/muxcool/session.go
+@@ -30,6 +30,20 @@ type sessionOwner interface {
+ 	removeSession(uint16)
+ }
+ 
++// deadlineWriter is the carrier-aware part of sessionOwner. The transport
++// tests use owners that only implement writeFrame; production carriers bound
++// the wait and the physical write with the deadline.
++type deadlineWriter interface {
++	writeFrameDeadline(Frame, time.Time) error
++}
++
++func writeFrameWithDeadline(owner sessionOwner, frame Frame, deadline time.Time) error {
++	if writer, ok := owner.(deadlineWriter); ok {
++		return writer.writeFrameDeadline(frame, deadline)
++	}
++	return owner.writeFrame(frame)
++}
++
+ type workerSession interface {
+ 	deliverDecodedFrame(decodedFrame) error
+ 	closeCarrier(error)
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index 427bdbb..31e0511 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -4,12 +4,19 @@ import (
+ 	"context"
+ 	"errors"
+ 	"net"
++	"os"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ )
+ 
+-var errWorkerUnavailable = errors.New("mux.cool carrier is unavailable")
++var (
++	errWorkerUnavailable = errors.New("mux.cool carrier is unavailable")
++	// ErrCarrierWriteTimeout reports a carrier whose underlying connection
++	// stopped accepting a frame. The carrier is closed: after a partial frame
++	// write the stream cannot be resumed without corrupting the framing.
++	ErrCarrierWriteTimeout = errors.New("mux.cool carrier write stalled")
++)
+ 
+ type carrierWorker struct {
+ 	conn        net.Conn
+@@ -19,19 +26,22 @@ type carrierWorker struct {
+ 	onIdle      func(*carrierWorker)
+ 	onAvailable func(*carrierWorker)
+ 
+-	writeMu     sync.Mutex
+-	writeBuffer []byte
+-	buffered    atomic.Int64
+-	maxBuffered atomic.Int64
+-	mu          sync.Mutex
+-	sessions    map[uint16]workerSession
+-	nextID      uint32
+-	lifetime    int
+-	draining    bool
+-	closed      bool
+-	closedFast  atomic.Bool
+-	closeErr    error
+-	closeOnce   sync.Once
++	writeToken   chan struct{}
++	writeBuffer  []byte
++	writeTimeout atomic.Int64
++	buffered     atomic.Int64
++	maxBuffered  atomic.Int64
++	mu           sync.Mutex
++	sessions     map[uint16]workerSession
++	nextID       uint32
++	lifetime     int
++	draining     bool
++	closed       bool
++	closedFast   atomic.Bool
++	closeErr     error
++	closeOnce    sync.Once
++	failOnce     sync.Once
++	closedCh     chan struct{}
+ }
+ 
+ func newCarrierWorker(conn net.Conn, maxActive, maxLifetime int, onClosed func(*carrierWorker)) *carrierWorker {
+@@ -41,7 +51,10 @@ func newCarrierWorker(conn net.Conn, maxActive, maxLifetime int, onClosed func(*
+ 		maxLifetime: maxLifetime,
+ 		onClosed:    onClosed,
+ 		sessions:    make(map[uint16]workerSession),
++		writeToken:  make(chan struct{}, 1),
++		closedCh:    make(chan struct{}),
+ 	}
++	w.writeToken <- struct{}{}
+ 	go w.readLoop()
+ 	return w
+ }
+@@ -138,33 +151,99 @@ func (w *carrierWorker) creditDownlink(n int) {
+ }
+ 
+ func (w *carrierWorker) writeFrame(frame Frame) error {
+-	w.writeMu.Lock()
++	return w.writeFrameDeadline(frame, time.Time{})
++}
++
++// writeFrameDeadline serializes one whole frame on the carrier. The deadline
++// bounds both the wait for the write turn and the physical write; a timeout
++// during the write closes the carrier because the frame may be partial. A
++// timeout while waiting for the turn leaves the carrier untouched.
++func (w *carrierWorker) writeFrameDeadline(frame Frame, deadline time.Time) error {
++	deadline, err := w.acquireWrite(deadline)
++	if err != nil {
++		return err
++	}
++	defer w.releaseWrite()
++
++	if w.closedFast.Load() {
++		return w.closeCause()
++	}
+ 	raw, err := encodeFrame(w.writeBuffer, frame)
+ 	if err != nil {
+-		w.writeMu.Unlock()
+ 		return err
+ 	}
+ 	w.writeBuffer = raw[:0]
+ 	if w.closedFast.Load() {
+-		w.mu.Lock()
+-		err = w.closeErr
+-		if err == nil {
+-			err = net.ErrClosed
+-		}
+-		w.mu.Unlock()
+-		w.writeMu.Unlock()
+-		return err
++		return w.closeCause()
++	}
++	if !deadline.IsZero() {
++		_ = w.conn.SetWriteDeadline(deadline)
+ 	}
+ 	err = writeFull(w.conn, raw)
+-	w.writeMu.Unlock()
++	if !deadline.IsZero() {
++		_ = w.conn.SetWriteDeadline(time.Time{})
++	}
+ 	if err != nil {
+-		// Closing may re-enter writeFrame through a session's End path. Defer the
+-		// fan-out until this call has returned to keep close paths acyclic.
+-		go w.close(err)
++		if isNetTimeout(err) {
++			err = ErrCarrierWriteTimeout
++		}
++		w.fail(err)
+ 	}
+ 	return err
+ }
+ 
++func (w *carrierWorker) acquireWrite(deadline time.Time) (time.Time, error) {
++	if timeout := time.Duration(w.writeTimeout.Load()); timeout > 0 {
++		limit := time.Now().Add(timeout)
++		if deadline.IsZero() || deadline.After(limit) {
++			deadline = limit
++		}
++	}
++	if !deadline.IsZero() && !time.Now().Before(deadline) {
++		return deadline, os.ErrDeadlineExceeded
++	}
++	if deadline.IsZero() {
++		select {
++		case <-w.writeToken:
++			return deadline, nil
++		case <-w.closedCh:
++			return deadline, w.closeCause()
++		}
++	}
++	timer := time.NewTimer(time.Until(deadline))
++	defer timer.Stop()
++	select {
++	case <-w.writeToken:
++		return deadline, nil
++	case <-timer.C:
++		return deadline, os.ErrDeadlineExceeded
++	case <-w.closedCh:
++		return deadline, w.closeCause()
++	}
++}
++
++func (w *carrierWorker) releaseWrite() {
++	w.writeToken <- struct{}{}
++}
++
++func (w *carrierWorker) closeCause() error {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if w.closeErr != nil {
++		return w.closeErr
++	}
++	return net.ErrClosed
++}
++
++// fail closes the carrier once. The close runs in its own goroutine because
++// it fans out to sessions whose End frames call writeFrame again; closing
++// inline would re-enter the write turn held by the failing caller.
++func (w *carrierWorker) fail(cause error) {
++	w.failOnce.Do(func() {
++		go w.close(cause)
++	})
++}
++
+ func (w *carrierWorker) removeSession(id uint16) {
+ 	w.mu.Lock()
+ 	wasFull := len(w.sessions) >= w.maxActive
+@@ -235,6 +314,7 @@ func (w *carrierWorker) close(cause error) {
+ 		}
+ 		w.sessions = nil
+ 		w.mu.Unlock()
++		close(w.closedCh)
+ 
+ 		_ = w.conn.Close()
+ 		for _, logicalSession := range sessions {

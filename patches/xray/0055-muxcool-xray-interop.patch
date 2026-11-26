@@ -1,0 +1,569 @@
+rain-core: xray/0055-muxcool-xray-interop
+Source: ReClash test on top of xray/0037 (GPL-3.0).
+
+Add a real Xray-core interop test, gated by MIHOMO_XRAY_BIN. It starts a
+pinned Xray VLESS inbound (plain, TLS 1.3 and Vision) with a freedom outbound
+that allows loopback for the harness, local TCP/UDP echo services, and drives
+them through the mihomo mux.cool outbound: TCP, server-first, XUDP, concurrent
+TCP+UDP, carrier rotation, TLS, Vision with UDP-only mux, XUDP GlobalID
+rebind, and an Xray client with mux as the reference implementation. The
+series repository runs it in CI with tool/xray_interop.sh, which downloads
+Xray 26.11.9 and verifies its SHA256 before use.
+
+Tests: TestXrayInterop (subtests TCP, ServerFirst, UDP, ConcurrentTCPAndUDP,
+CarrierRotation, TLS, VisionXUDPOnly, XUDPGlobalIDRebind, ReferenceXrayClient).
+diff --git a/adapter/outbound/muxcool_interop_test.go b/adapter/outbound/muxcool_interop_test.go
+new file mode 100644
+index 0000000..b25a2a0
+--- /dev/null
++++ b/adapter/outbound/muxcool_interop_test.go
+@@ -0,0 +1,549 @@
++package outbound
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"io"
++	"math/big"
++	"net"
++	"net/netip"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++// The interop test runs only with a real Xray-core binary:
++//
++//	MIHOMO_XRAY_BIN=/path/to/xray go test -run TestXrayInterop ./adapter/outbound/
++//
++// tool/xray_interop.sh downloads the pinned release and sets the variable.
++// The test skips instead of silently passing when the binary is absent; CI
++// runs it in a dedicated job.
++
++const interopUUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
++
++func xrayBinary(t *testing.T) string {
++	t.Helper()
++	path := os.Getenv("MIHOMO_XRAY_BIN")
++	if path == "" {
++		t.Skip("MIHOMO_XRAY_BIN is not set; run tool/xray_interop.sh")
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatalf("MIHOMO_XRAY_BIN: %v", err)
++	}
++	if info.IsDir() {
++		t.Fatalf("MIHOMO_XRAY_BIN is a directory: %s", path)
++	}
++	return path
++}
++
++func TestXrayInterop(t *testing.T) {
++	bin := xrayBinary(t)
++	t.Run("TCP", func(t *testing.T) {
++		echoPort := startTCPEcho(t, "")
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{})
++		assertTCPEcho(t, mux, echoPort, "hello over mux.cool")
++	})
++	t.Run("ServerFirst", func(t *testing.T) {
++		echoPort := startTCPEcho(t, "220 interop\r\n")
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{})
++		conn := dialInteropTCP(t, mux, echoPort)
++		defer conn.Close()
++		greeting := make([]byte, len("220 interop\r\n"))
++		if _, err := io.ReadFull(conn, greeting); err != nil {
++			t.Fatalf("read greeting: %v", err)
++		}
++		if string(greeting) != "220 interop\r\n" {
++			t.Fatalf("greeting = %q", greeting)
++		}
++	})
++	t.Run("UDP", func(t *testing.T) {
++		udpPort := startUDPEcho(t)
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{})
++		assertUDPEcho(t, mux, udpPort, "dns query", 40001)
++	})
++	t.Run("ConcurrentTCPAndUDP", func(t *testing.T) {
++		echoPort := startTCPEcho(t, "")
++		udpPort := startUDPEcho(t)
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{MaxConcurrency: 4})
++		const flows = 6
++		var wg sync.WaitGroup
++		for i := 0; i < flows; i++ {
++			wg.Add(2)
++			go func(index int) {
++				defer wg.Done()
++				payload := fmt.Sprintf("tcp-%d", index)
++				assertTCPEcho(t, mux, echoPort, payload)
++			}(i)
++			go func(index int) {
++				defer wg.Done()
++				payload := fmt.Sprintf("udp-%d", index)
++				assertUDPEcho(t, mux, udpPort, payload, uint16(41000+index))
++			}(i)
++		}
++		wg.Wait()
++	})
++	t.Run("CarrierRotation", func(t *testing.T) {
++		echoPort := startTCPEcho(t, "")
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{MaxConnections: 1})
++		for i := 0; i < 3; i++ {
++			assertTCPEcho(t, mux, echoPort, fmt.Sprintf("rotation-%d", i))
++			waitForCondition(t, func() bool {
++				stats := mux.(*MuxCool).Stats()
++				return stats.TCP.TCPSessions == 0
++			})
++		}
++		if closes := mux.(*MuxCool).Stats().TCP.CarrierCloses["draining"]; closes == 0 {
++			t.Fatalf("no draining carrier after three rotations: %+v", mux.(*MuxCool).Stats().TCP)
++		}
++	})
++	t.Run("TLS", func(t *testing.T) {
++		certFile, keyFile := writeSelfSignedCert(t)
++		echoPort := startTCPEcho(t, "")
++		udpPort := startUDPEcho(t)
++		serverPort := startXrayServer(t, bin, tlsStream(certFile, keyFile), "")
++		mux := newInteropMux(t, serverPort, true, "", MuxCoolOption{})
++		assertTCPEcho(t, mux, echoPort, "tls mux")
++		assertUDPEcho(t, mux, udpPort, "tls xudp", 42001)
++	})
++	t.Run("VisionXUDPOnly", func(t *testing.T) {
++		certFile, keyFile := writeSelfSignedCert(t)
++		echoPort := startTCPEcho(t, "")
++		udpPort := startUDPEcho(t)
++		serverPort := startXrayServer(t, bin, tlsStream(certFile, keyFile), "xtls-rprx-vision")
++		mux := newInteropMux(t, serverPort, true, "xtls-rprx-vision", MuxCoolOption{
++			TCPDisabled: true, XUDPConcurrency: 4,
++		})
++		// TCP stays plain Vision; UDP uses the mux carrier.
++		assertTCPEcho(t, mux, echoPort, "vision tcp")
++		assertUDPEcho(t, mux, udpPort, "vision xudp", 43001)
++		if stats := mux.(*MuxCool).Stats(); stats.UDP.Carriers != 1 {
++			t.Fatalf("UDP-only mux stats = %+v", stats)
++		}
++	})
++	t.Run("XUDPGlobalIDRebind", func(t *testing.T) {
++		udpPort := startUDPEcho(t)
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		mux := newInteropMux(t, serverPort, false, "", MuxCoolOption{})
++		for i := 0; i < 2; i++ {
++			assertUDPEcho(t, mux, udpPort, fmt.Sprintf("rebind-%d", i), 44001)
++		}
++	})
++	t.Run("ReferenceXrayClient", func(t *testing.T) {
++		echoPort := startTCPEcho(t, "")
++		serverPort := startXrayServer(t, bin, plainStream(), "")
++		socksPort := startXrayClient(t, bin, serverPort)
++		assertSocksTCPEcho(t, socksPort, echoPort, "reference client")
++	})
++}
++
++func plainStream() map[string]any {
++	return map[string]any{"network": "tcp", "security": "none"}
++}
++
++func tlsStream(certFile, keyFile string) map[string]any {
++	return map[string]any{
++		"network":  "tcp",
++		"security": "tls",
++		"tlsSettings": map[string]any{
++			"certificates": []any{map[string]any{
++				"certificateFile": certFile,
++				"keyFile":         keyFile,
++			}},
++			"minVersion": "1.3",
++		},
++	}
++}
++
++func startXrayServer(t *testing.T, bin string, stream map[string]any, flow string) int {
++	t.Helper()
++	port := freeTCPPort(t)
++	client := map[string]any{"id": interopUUID}
++	if flow != "" {
++		client["flow"] = flow
++	}
++	config := map[string]any{
++		"log": map[string]any{"loglevel": "warning"},
++		"inbounds": []any{map[string]any{
++			"listen":   "127.0.0.1",
++			"port":     port,
++			"protocol": "vless",
++			"settings": map[string]any{
++				"clients":    []any{client},
++				"decryption": "none",
++			},
++			"streamSettings": stream,
++		}},
++		"outbounds": []any{map[string]any{
++			"protocol": "freedom",
++			"settings": map[string]any{
++				// Xray blocks private destinations for VLESS inbounds by
++				// default; the harness targets loopback echo services.
++				"finalRules": []any{map[string]any{
++					"action": "allow",
++					"ip":     []any{"127.0.0.1/32"},
++				}},
++			},
++		}},
++	}
++	startXrayProcess(t, bin, config)
++	waitForListener(t, port)
++	return port
++}
++
++func startXrayClient(t *testing.T, bin string, serverPort int) int {
++	t.Helper()
++	port := freeTCPPort(t)
++	config := map[string]any{
++		"log": map[string]any{"loglevel": "warning"},
++		"inbounds": []any{map[string]any{
++			"listen":   "127.0.0.1",
++			"port":     port,
++			"protocol": "socks",
++			"settings": map[string]any{"udp": true},
++		}},
++		"outbounds": []any{map[string]any{
++			"protocol": "vless",
++			"settings": map[string]any{"vnext": []any{map[string]any{
++				"address": "127.0.0.1",
++				"port":    serverPort,
++				"users":   []any{map[string]any{"id": interopUUID, "encryption": "none"}},
++			}}},
++			"streamSettings": plainStream(),
++			"mux":            map[string]any{"enabled": true, "concurrency": 8},
++		}},
++	}
++	startXrayProcess(t, bin, config)
++	waitForListener(t, port)
++	return port
++}
++
++func startXrayProcess(t *testing.T, bin string, config map[string]any) {
++	t.Helper()
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.json")
++	raw, err := json.MarshalIndent(config, "", "  ")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	logPath := filepath.Join(dir, "xray.log")
++	logFile, err := os.Create(logPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cmd := exec.Command(bin, "-c", configPath)
++	cmd.Stdout = logFile
++	cmd.Stderr = logFile
++	if err := cmd.Start(); err != nil {
++		_ = logFile.Close()
++		t.Fatalf("start xray: %v", err)
++	}
++	t.Cleanup(func() {
++		_ = cmd.Process.Signal(os.Interrupt)
++		done := make(chan struct{})
++		go func() {
++			_ = cmd.Wait()
++			close(done)
++		}()
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++			_ = cmd.Process.Kill()
++			select {
++			case <-done:
++			case <-time.After(2 * time.Second):
++				t.Logf("xray process did not exit after kill")
++			}
++		}
++		_ = logFile.Close()
++		if t.Failed() {
++			if log, err := os.ReadFile(logPath); err == nil {
++				t.Logf("xray log:\n%s", log)
++			}
++		}
++	})
++}
++
++func waitForListener(t *testing.T, port int) {
++	t.Helper()
++	address := net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
++		if err == nil {
++			_ = conn.Close()
++			return
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	t.Fatalf("xray did not listen on %s", address)
++}
++
++func freeTCPPort(t *testing.T) int {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := listener.Addr().(*net.TCPAddr).Port
++	_ = listener.Close()
++	return port
++}
++
++func startTCPEcho(t *testing.T, greeting string) int {
++	t.Helper()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = listener.Close() })
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func(conn net.Conn) {
++				defer conn.Close()
++				if greeting != "" {
++					if _, err := io.WriteString(conn, greeting); err != nil {
++						return
++					}
++				}
++				_, _ = io.Copy(conn, conn)
++			}(conn)
++		}
++	}()
++	return listener.Addr().(*net.TCPAddr).Port
++}
++
++func startUDPEcho(t *testing.T) int {
++	t.Helper()
++	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = packetConn.Close() })
++	go func() {
++		buffer := make([]byte, 64*1024)
++		for {
++			n, addr, err := packetConn.ReadFrom(buffer)
++			if err != nil {
++				return
++			}
++			_, _ = packetConn.WriteTo(buffer[:n], addr)
++		}
++	}()
++	return packetConn.LocalAddr().(*net.UDPAddr).Port
++}
++
++func newInteropMux(t *testing.T, serverPort int, tls bool, flow string, option MuxCoolOption) ProxyAdapter {
++	t.Helper()
++	proxy, err := NewVless(VlessOption{
++		Name:           "xray-interop",
++		Server:         "127.0.0.1",
++		Port:           serverPort,
++		UUID:           interopUUID,
++		UDP:            true,
++		TLS:            tls,
++		ServerName:     "localhost",
++		SkipCertVerify: true,
++		Flow:           flow,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	option.Enabled = true
++	wrapped, err := NewMuxCool(option, proxy)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = wrapped.Close() })
++	return wrapped
++}
++
++func dialInteropTCP(t *testing.T, mux ProxyAdapter, port int) C.Conn {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	conn, err := mux.DialContext(ctx, &C.Metadata{
++		NetWork: C.TCP,
++		DstIP:   netip.MustParseAddr("127.0.0.1"),
++		DstPort: uint16(port),
++	})
++	if err != nil {
++		t.Fatalf("dial %d: %v", port, err)
++	}
++	return conn
++}
++
++func assertTCPEcho(t *testing.T, mux ProxyAdapter, port int, payload string) {
++	t.Helper()
++	conn := dialInteropTCP(t, mux, port)
++	defer conn.Close()
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	if _, err := io.WriteString(conn, payload); err != nil {
++		t.Fatalf("write %q: %v", payload, err)
++	}
++	response := make([]byte, len(payload))
++	if _, err := io.ReadFull(conn, response); err != nil {
++		t.Fatalf("read %q: %v", payload, err)
++	}
++	if string(response) != payload {
++		t.Fatalf("echo = %q, want %q", response, payload)
++	}
++}
++
++func assertUDPEcho(t *testing.T, mux ProxyAdapter, port int, payload string, sourcePort uint16) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		DstIP:   netip.MustParseAddr("127.0.0.1"),
++		DstPort: uint16(port),
++		SrcIP:   netip.MustParseAddr("192.0.2.10"),
++		SrcPort: sourcePort,
++	}
++	packetConn, err := mux.ListenPacketContext(ctx, metadata)
++	if err != nil {
++		t.Fatalf("listen packet %d: %v", port, err)
++	}
++	defer packetConn.Close()
++	target := net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)))
++	if _, err := packetConn.WriteTo([]byte(payload), target); err != nil {
++		t.Fatalf("write datagram %q: %v", payload, err)
++	}
++	_ = packetConn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	buffer := make([]byte, 64*1024)
++	n, addr, err := packetConn.ReadFrom(buffer)
++	if err != nil {
++		t.Fatalf("read datagram %q: %v", payload, err)
++	}
++	if string(buffer[:n]) != payload {
++		t.Fatalf("datagram = %q, want %q", buffer[:n], payload)
++	}
++	if addr == nil || addr.String() != target.String() {
++		t.Fatalf("datagram source = %v, want %v", addr, target)
++	}
++}
++
++func assertSocksTCPEcho(t *testing.T, socksPort, echoPort int, payload string) {
++	t.Helper()
++	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(socksPort)), 5*time.Second)
++	if err != nil {
++		t.Fatalf("dial socks: %v", err)
++	}
++	defer conn.Close()
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
++		t.Fatal(err)
++	}
++	reply := make([]byte, 2)
++	if _, err := io.ReadFull(conn, reply); err != nil || reply[0] != 5 || reply[1] != 0 {
++		t.Fatalf("socks greeting reply = %v, %v", reply, err)
++	}
++	request := []byte{5, 1, 0, 1, 127, 0, 0, 1, 0, 0}
++	request[8] = byte(echoPort >> 8)
++	request[9] = byte(echoPort)
++	if _, err := conn.Write(request); err != nil {
++		t.Fatal(err)
++	}
++	header := make([]byte, 4)
++	if _, err := io.ReadFull(conn, header); err != nil {
++		t.Fatalf("socks reply: %v", err)
++	}
++	if header[1] != 0 {
++		t.Fatalf("socks connect status = %d", header[1])
++	}
++	switch header[3] {
++	case 1:
++		_, _ = io.CopyN(io.Discard, conn, 4+2)
++	case 4:
++		_, _ = io.CopyN(io.Discard, conn, 16+2)
++	case 3:
++		length := make([]byte, 1)
++		if _, err := io.ReadFull(conn, length); err != nil {
++			t.Fatal(err)
++		}
++		_, _ = io.CopyN(io.Discard, conn, int64(length[0])+2)
++	default:
++		t.Fatalf("socks address type = %d", header[3])
++	}
++	if _, err := io.WriteString(conn, payload); err != nil {
++		t.Fatal(err)
++	}
++	response := make([]byte, len(payload))
++	if _, err := io.ReadFull(conn, response); err != nil {
++		t.Fatalf("read echo: %v", err)
++	}
++	if !bytes.Equal(response, []byte(payload)) {
++		t.Fatalf("echo = %q, want %q", response, payload)
++	}
++}
++
++func writeSelfSignedCert(t *testing.T) (string, string) {
++	t.Helper()
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	template := x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "localhost"},
++		DNSNames:     []string{"localhost"},
++		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(24 * time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++	}
++	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	dir := t.TempDir()
++	certFile := filepath.Join(dir, "cert.pem")
++	keyFile := filepath.Join(dir, "key.pem")
++	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
++	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
++	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return certFile, keyFile
++}
++
++func waitForCondition(t *testing.T, condition func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for !condition() && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if !condition() {
++		t.Fatal("condition was not satisfied before timeout")
++	}
++}

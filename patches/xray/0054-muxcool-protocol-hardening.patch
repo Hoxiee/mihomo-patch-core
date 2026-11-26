@@ -1,0 +1,615 @@
+rain-core: xray/0054-muxcool-protocol-hardening
+Source: ReClash fix on top of xray/0037 (GPL-3.0).
+
+Only the client opens sessions. A server-initiated New frame is now ignored
+with its payload, as Xray's client does, instead of being delivered as
+ordinary stream data. Add codec fuzz targets over the golden corpus and the
+malformed cases, protocol edge tests (maximum domain and payload, fragmented
+input, multiple frames per read, keepalive, data after End, SessionID
+exhaustion, writes after close), and benchmarks for the codec, the carrier
+write turn and the pool/session paths. The uncontended write turn no longer
+allocates a timer per frame; the deadline timer exists only while contended.
+The benchmarks were also run against the pre-fix tree; the measured deltas are
+recorded in the README.
+
+Tests: FuzzDecodeFrame, FuzzDecodeFramePooled, TestServerInitiatedNewIsIgnored,
+TestDecodeFrameAcceptsMaxDomainAndRejectsOverflow,
+TestDecodeFrameAcceptsMaxPayload, TestDecodeFrameHandlesFragmentedInput,
+TestDecodeFrameReadsOneFrameFromBufferedChunk, TestWorkerSessionIDExhaustion.
+diff --git a/transport/muxcool/bench_test.go b/transport/muxcool/bench_test.go
+new file mode 100644
+index 0000000..bf6df80
+--- /dev/null
++++ b/transport/muxcool/bench_test.go
+@@ -0,0 +1,131 @@
++package muxcool
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"sync"
++	"testing"
++	"time"
++)
++
++// discardConn is a carrier whose writes complete at once and whose reads
++// block until close. It isolates codec and session overhead from the network.
++type discardConn struct {
++	once   sync.Once
++	closed chan struct{}
++}
++
++func newDiscardConn() *discardConn {
++	return &discardConn{closed: make(chan struct{})}
++}
++
++func (c *discardConn) Read([]byte) (int, error) {
++	<-c.closed
++	return 0, net.ErrClosed
++}
++
++func (c *discardConn) Write(p []byte) (int, error) { return len(p), nil }
++
++func (c *discardConn) Close() error {
++	c.once.Do(func() { close(c.closed) })
++	return nil
++}
++
++func (c *discardConn) LocalAddr() net.Addr              { return muxAddr("bench") }
++func (c *discardConn) RemoteAddr() net.Addr             { return muxAddr("bench") }
++func (c *discardConn) SetDeadline(time.Time) error      { return nil }
++func (c *discardConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *discardConn) SetWriteDeadline(time.Time) error { return nil }
++
++func benchmarkPayload() []byte {
++	return bytes.Repeat([]byte{0x5a}, MaxPayloadSize)
++}
++
++func BenchmarkEncodeKeepData(b *testing.B) {
++	frame := Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: benchmarkPayload()}
++	b.ReportAllocs()
++	b.SetBytes(int64(len(frame.Payload)))
++	for i := 0; i < b.N; i++ {
++		if _, err := EncodeFrame(frame); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkDecodeKeepData(b *testing.B) {
++	raw, err := EncodeFrame(Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: benchmarkPayload()})
++	if err != nil {
++		b.Fatal(err)
++	}
++	b.ReportAllocs()
++	b.SetBytes(int64(len(raw)))
++	for i := 0; i < b.N; i++ {
++		if _, err := DecodeFrame(bytes.NewReader(raw)); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkCarrierWriteFrame(b *testing.B) {
++	worker := newCarrierWorker(newDiscardConn(), 128, 1<<30, nil)
++	b.Cleanup(func() { worker.close(nil) })
++	frame := Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: benchmarkPayload()}
++	b.ReportAllocs()
++	b.SetBytes(int64(len(frame.Payload)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if err := worker.writeFrame(frame); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkPoolDialAndClose(b *testing.B) {
++	pool := NewPool(func(context.Context) (net.Conn, error) {
++		return newDiscardConn(), nil
++	}, Options{
++		MaxConcurrency:      128,
++		MaxConnections:      1 << 30,
++		FirstPayloadTimeout: time.Hour,
++		IdleTimeout:         time.Hour,
++	})
++	b.Cleanup(func() { _ = pool.Close() })
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		conn, err := pool.DialContext(context.Background(), "bench.example", 443)
++		if err != nil {
++			b.Fatal(err)
++		}
++		if err := conn.Close(); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkStreamWriteEightKiB(b *testing.B) {
++	pool := NewPool(func(context.Context) (net.Conn, error) {
++		return newDiscardConn(), nil
++	}, Options{
++		MaxConcurrency:      8,
++		MaxConnections:      1 << 30,
++		FirstPayloadTimeout: time.Hour,
++		IdleTimeout:         time.Hour,
++	})
++	b.Cleanup(func() { _ = pool.Close() })
++	conn, err := pool.DialContext(context.Background(), "bench.example", 443)
++	if err != nil {
++		b.Fatal(err)
++	}
++	b.Cleanup(func() { _ = conn.Close() })
++	payload := benchmarkPayload()
++	b.ReportAllocs()
++	b.SetBytes(int64(len(payload)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if _, err := conn.Write(payload); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
+diff --git a/transport/muxcool/bench_timeout_test.go b/transport/muxcool/bench_timeout_test.go
+new file mode 100644
+index 0000000..691753b
+--- /dev/null
++++ b/transport/muxcool/bench_timeout_test.go
+@@ -0,0 +1,21 @@
++package muxcool
++
++import (
++	"testing"
++	"time"
++)
++
++func BenchmarkCarrierWriteFrameWithTimeout(b *testing.B) {
++	worker := newCarrierWorker(newDiscardConn(), 128, 1<<30, nil)
++	worker.writeTimeout.Store(int64(30 * time.Second))
++	b.Cleanup(func() { worker.close(nil) })
++	frame := Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: benchmarkPayload()}
++	b.ReportAllocs()
++	b.SetBytes(int64(len(frame.Payload)))
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if err := worker.writeFrame(frame); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
+diff --git a/transport/muxcool/fuzz_test.go b/transport/muxcool/fuzz_test.go
+new file mode 100644
+index 0000000..c0a1b65
+--- /dev/null
++++ b/transport/muxcool/fuzz_test.go
+@@ -0,0 +1,61 @@
++package muxcool
++
++import (
++	"bytes"
++	"encoding/hex"
++	"testing"
++)
++
++// FuzzDecodeFrame exercises the wire decoder with arbitrary server input. A
++// malformed frame must produce an error, never a panic or an unbounded
++// allocation; every frame that decodes must be re-encodable without panicking.
++func FuzzDecodeFrame(f *testing.F) {
++	for _, raw := range referenceFrames {
++		seed, err := hex.DecodeString(raw)
++		if err != nil {
++			f.Fatalf("decode seed: %v", err)
++		}
++		f.Add(seed)
++	}
++	for _, seed := range [][]byte{
++		{},
++		{0},
++		{0x02, 0x01},
++		{0, 4, 0, 1, 9, 0},
++		{0, 4, 0, 1, 1, 0},
++		{0, 0xff, 0xff},
++		{0, 4, 0, 1, 2, 1},
++		{0, 4, 0, 1, 3, 0, 0xff, 0xff},
++	} {
++		f.Add(seed)
++	}
++	f.Fuzz(func(t *testing.T, raw []byte) {
++		frame, err := DecodeFrame(bytes.NewReader(raw))
++		if err != nil {
++			return
++		}
++		if len(frame.Payload) > int(^uint16(0)) {
++			t.Fatalf("payload length %d exceeds the wire limit", len(frame.Payload))
++		}
++		_, _ = EncodeFrame(frame)
++	})
++}
++
++// FuzzDecodeFramePooled covers the pooled path the carrier read loop uses;
++// a decoded payload must always be returned to the pool exactly once.
++func FuzzDecodeFramePooled(f *testing.F) {
++	for _, raw := range referenceFrames {
++		seed, err := hex.DecodeString(raw)
++		if err != nil {
++			f.Fatalf("decode seed: %v", err)
++		}
++		f.Add(seed)
++	}
++	f.Fuzz(func(t *testing.T, raw []byte) {
++		decoded, err := decodeFramePooled(bytes.NewReader(raw), make([]byte, MaxMetadataSize))
++		if err != nil {
++			return
++		}
++		decoded.releasePayload()
++	})
++}
+diff --git a/transport/muxcool/packet_session.go b/transport/muxcool/packet_session.go
+index 822f58b..0136baa 100644
+--- a/transport/muxcool/packet_session.go
++++ b/transport/muxcool/packet_session.go
+@@ -216,6 +216,11 @@ func (s *packetSession) writeDeadlineTime() time.Time {
+ 
+ func (s *packetSession) deliverDecodedFrame(decoded decodedFrame) error {
+ 	frame := decoded.Frame
++	if frame.Status == StatusNew {
++		// Only the client opens sessions; ignore a server-initiated New.
++		decoded.releasePayload()
++		return nil
++	}
+ 	if frame.Option&OptionData != 0 {
+ 		var (
+ 			addr net.Addr
+diff --git a/transport/muxcool/protocol_test.go b/transport/muxcool/protocol_test.go
+new file mode 100644
+index 0000000..91eba4e
+--- /dev/null
++++ b/transport/muxcool/protocol_test.go
+@@ -0,0 +1,272 @@
++package muxcool
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestDecodeFrameAcceptsMaxDomainAndRejectsOverflow(t *testing.T) {
++	domain := string(bytes.Repeat([]byte{'a'}, 255))
++	raw, err := EncodeFrame(Frame{SessionID: 1, Status: StatusNew, Network: NetworkTCP, Destination: domain, Port: 443})
++	if err != nil {
++		t.Fatalf("encode max domain: %v", err)
++	}
++	frame, err := DecodeFrame(bytes.NewReader(raw))
++	if err != nil {
++		t.Fatalf("decode max domain: %v", err)
++	}
++	if frame.Destination != domain {
++		t.Fatalf("domain length = %d, want 255", len(frame.Destination))
++	}
++	if _, err := EncodeFrame(Frame{SessionID: 1, Status: StatusNew, Network: NetworkTCP, Destination: domain + "a", Port: 443}); err == nil {
++		t.Fatal("encode accepted a 256-byte domain")
++	}
++}
++
++func TestDecodeFrameAcceptsMaxPayload(t *testing.T) {
++	payload := bytes.Repeat([]byte{0x7f}, int(^uint16(0)))
++	raw, err := EncodeFrame(Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: payload})
++	if err != nil {
++		t.Fatalf("encode max payload: %v", err)
++	}
++	frame, err := DecodeFrame(bytes.NewReader(raw))
++	if err != nil {
++		t.Fatalf("decode max payload: %v", err)
++	}
++	if !bytes.Equal(frame.Payload, payload) {
++		t.Fatalf("payload length = %d, want %d", len(frame.Payload), len(payload))
++	}
++	if _, err := EncodeFrame(Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: append(payload, 0)}); err == nil {
++		t.Fatal("encode accepted a payload above uint16")
++	}
++}
++
++func TestServerInitiatedNewIsIgnored(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	conn, err := worker.openSession(context.Background(), "new.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++
++	carrier.inject(t, Frame{
++		SessionID: 1, Status: StatusNew, Option: OptionData, Network: NetworkTCP,
++		Destination: "spoof.example", Port: 443, Payload: []byte("ignored"),
++	})
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: []byte("real")})
++
++	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++	got := make([]byte, len("real"))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatalf("read after server New: %v", err)
++	}
++	if string(got) != "real" {
++		t.Fatalf("payload = %q, want the Keep payload", got)
++	}
++	if carrier.isClosed() {
++		t.Fatal("a server-initiated New closed the carrier")
++	}
++}
++
++func TestKeepAliveDoesNotDisturbSession(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	conn, err := worker.openSession(context.Background(), "keepalive.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusKeepAlive})
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: []byte("after")})
++	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++	got := make([]byte, len("after"))
++	if _, err := io.ReadFull(conn, got); err != nil {
++		t.Fatalf("read after keepalive: %v", err)
++	}
++	if string(got) != "after" {
++		t.Fatalf("payload = %q", got)
++	}
++}
++
++func TestDataAfterEndKeepsCarrierAndSibling(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	first, err := worker.openSession(context.Background(), "ended.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = first.Close() })
++	second, err := worker.openSession(context.Background(), "sibling.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = second.Close() })
++
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusEnd})
++	carrier.inject(t, Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: []byte("late")})
++	carrier.inject(t, Frame{SessionID: 2, Status: StatusKeep, Option: OptionData, Payload: []byte("sibling")})
++
++	_ = second.SetReadDeadline(time.Now().Add(time.Second))
++	got := make([]byte, len("sibling"))
++	if _, err := io.ReadFull(second, got); err != nil {
++		t.Fatalf("sibling read: %v", err)
++	}
++	if string(got) != "sibling" {
++		t.Fatalf("sibling payload = %q", got)
++	}
++	if carrier.isClosed() {
++		t.Fatal("data after End closed the carrier")
++	}
++}
++
++func TestWorkerSessionIDExhaustion(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 1<<30, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	worker.mu.Lock()
++	worker.nextID = uint32(^uint16(0)) - 1
++	worker.mu.Unlock()
++
++	conn, err := worker.openSession(context.Background(), "last.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	worker.mu.Lock()
++	id := worker.nextID
++	draining := worker.draining
++	worker.mu.Unlock()
++	if id != uint32(^uint16(0)) || !draining {
++		t.Fatalf("last id = %d draining = %t", id, draining)
++	}
++	if _, err := worker.openSession(context.Background(), "overflow.example", 80, time.Hour); !errors.Is(err, errWorkerUnavailable) {
++		t.Fatalf("open after exhaustion = %v, want %v", err, errWorkerUnavailable)
++	}
++}
++
++// oneByteReader delivers the frame in single-byte reads, as a carrier can
++// under TLS record fragmentation.
++type oneByteReader struct {
++	raw []byte
++}
++
++func (r *oneByteReader) Read(p []byte) (int, error) {
++	if len(r.raw) == 0 {
++		return 0, io.EOF
++	}
++	p[0] = r.raw[0]
++	r.raw = r.raw[1:]
++	return 1, nil
++}
++
++func TestDecodeFrameHandlesFragmentedInput(t *testing.T) {
++	raw, err := EncodeFrame(Frame{
++		SessionID: 9, Status: StatusNew, Option: OptionData, Network: NetworkUDP,
++		Destination: "fragment.example", Port: 53, GlobalID: [8]byte{1, 2, 3},
++		Payload: []byte("payload"),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	frame, err := DecodeFrame(&oneByteReader{raw: raw})
++	if err != nil {
++		t.Fatalf("fragmented decode: %v", err)
++	}
++	if frame.SessionID != 9 || string(frame.Payload) != "payload" || frame.GlobalID != [8]byte{1, 2, 3} {
++		t.Fatalf("frame = %+v", frame)
++	}
++}
++
++// chunkReader returns both frames from one Read; the decoder must consume
++// exactly one frame and leave the rest for the next call.
++type chunkReader struct {
++	raw []byte
++}
++
++func (r *chunkReader) Read(p []byte) (int, error) {
++	if len(r.raw) == 0 {
++		return 0, io.EOF
++	}
++	n := copy(p, r.raw)
++	r.raw = r.raw[n:]
++	return n, nil
++}
++
++func TestDecodeFrameReadsOneFrameFromBufferedChunk(t *testing.T) {
++	first, err := EncodeFrame(Frame{SessionID: 1, Status: StatusKeep, Option: OptionData, Payload: []byte("one")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	second, err := EncodeFrame(Frame{SessionID: 2, Status: StatusKeep, Option: OptionData, Payload: []byte("two")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	reader := &chunkReader{raw: append(first, second...)}
++	one, err := DecodeFrame(reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	two, err := DecodeFrame(reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(one.Payload) != "one" || string(two.Payload) != "two" {
++		t.Fatalf("frames = %q, %q", one.Payload, two.Payload)
++	}
++}
++
++func TestWorkerCloseIsIdempotentAndEndsSessions(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	conn, err := worker.openSession(context.Background(), "close.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	worker.close(nil)
++	worker.close(errors.New("second close"))
++	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := conn.Read(make([]byte, 1)); err == nil {
++		t.Fatal("session survived carrier close")
++	}
++	if !carrier.isClosed() {
++		t.Fatal("carrier conn was not closed")
++	}
++	waitFor(t, func() bool { return worker.activeSessions() == 0 })
++}
++
++func TestSessionWriteAfterCarrierCloseFails(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	conn, err := worker.openSession(context.Background(), "write.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	worker.close(nil)
++	if _, err := conn.Write([]byte("late")); err == nil {
++		t.Fatal("write after carrier close succeeded")
++	}
++}
++
++func TestPacketWriteAfterCloseFails(t *testing.T) {
++	carrier := newTestCarrier()
++	worker := newCarrierWorker(carrier, 8, 128, nil)
++	t.Cleanup(func() { worker.close(nil) })
++	packetConn, err := worker.openPacketSession("udp.example", 53, [8]byte{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = packetConn.Close()
++	if _, err := packetConn.WriteTo([]byte("late"), &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}); err == nil {
++		t.Fatal("write after packet close succeeded")
++	}
++}
+diff --git a/transport/muxcool/session.go b/transport/muxcool/session.go
+index 54ff2ba..2c7de09 100644
+--- a/transport/muxcool/session.go
++++ b/transport/muxcool/session.go
+@@ -268,6 +268,13 @@ func (s *session) runDownlink() {
+ 
+ func (s *session) deliverDecodedFrame(decoded decodedFrame) error {
+ 	frame := decoded.Frame
++	if frame.Status == StatusNew {
++		// Only the client opens sessions; Xray's client ignores a
++		// server-initiated New and drops its payload instead of failing the
++		// carrier.
++		decoded.releasePayload()
++		return nil
++	}
+ 	terminal := frame.Status == StatusEnd || frame.Option&OptionError != 0
+ 	if frame.Option&OptionData == 0 && !terminal {
+ 		decoded.releasePayload()
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index af77832..fc6a880 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -240,11 +240,10 @@ func (w *carrierWorker) writeFrameDeadline(frame Frame, deadline time.Time) erro
+ 	}
+ 	if !deadline.IsZero() {
+ 		_ = w.conn.SetWriteDeadline(deadline)
+-	}
+-	err = writeFull(w.conn, raw)
+-	if !deadline.IsZero() {
++	} else {
+ 		_ = w.conn.SetWriteDeadline(time.Time{})
+ 	}
++	err = writeFull(w.conn, raw)
+ 	if err != nil {
+ 		if isNetTimeout(err) {
+ 			w.writeTimeouts.Add(1)
+@@ -256,11 +255,13 @@ func (w *carrierWorker) writeFrameDeadline(frame Frame, deadline time.Time) erro
+ }
+ 
+ func (w *carrierWorker) acquireWrite(deadline time.Time) (time.Time, error) {
+-	if timeout := time.Duration(w.writeTimeout.Load()); timeout > 0 {
+-		limit := time.Now().Add(timeout)
+-		if deadline.IsZero() || deadline.After(limit) {
+-			deadline = limit
+-		}
++	deadline = w.clampWriteDeadline(deadline)
++	// The uncontended path is one frame after another on the same carrier;
++	// a timer per frame would cost more than the frame itself.
++	select {
++	case <-w.writeToken:
++		return deadline, nil
++	default:
+ 	}
+ 	if !deadline.IsZero() && !time.Now().Before(deadline) {
+ 		return deadline, os.ErrDeadlineExceeded
+@@ -285,6 +286,16 @@ func (w *carrierWorker) acquireWrite(deadline time.Time) (time.Time, error) {
+ 	}
+ }
+ 
++func (w *carrierWorker) clampWriteDeadline(deadline time.Time) time.Time {
++	if timeout := time.Duration(w.writeTimeout.Load()); timeout > 0 {
++		limit := time.Now().Add(timeout)
++		if deadline.IsZero() || deadline.After(limit) {
++			return limit
++		}
++	}
++	return deadline
++}
++
+ func (w *carrierWorker) releaseWrite() {
+ 	w.writeToken <- struct{}{}
+ }

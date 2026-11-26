@@ -93,16 +93,93 @@ tool/test.sh --profile reclash --keep   # leave the checkout for inspection
 The packages are listed in `tool/packages.txt`. The build uses `with_gvisor`, the tag ReClash
 ships with. Tests that need an Xray binary or external network skip themselves.
 
+`tool/xray_interop.sh` runs the mux.cool interop test against a pinned Xray-core release. It
+downloads `Xray-linux-64.zip` for `XRAY_VERSION` (default 26.11.9), verifies `XRAY_SHA256`, clones
+the base, applies the `core` profile and runs `TestXrayInterop`:
+
+```bash
+tool/xray_interop.sh
+tool/xray_interop.sh --target ../ReClash/core/.mihomo   # existing core-profile checkout
+```
+
+CI runs the same script in the `interop` job. Without `MIHOMO_XRAY_BIN` the Go test skips with an
+explicit message, so a normal `tool/test.sh` run stays self-contained.
+
 ## Profiles
 
 | Profile | Patches | Contents |
 |---|---:|---|
-| `core` | 40 | xray 37 + diagnostics 3 |
-| `flclash` | 42 | core + FlClash host 1 + feature.Android adaptation 1 |
-| `reclash` | 63 | flclash + ReClash 21 |
+| `core` | 48 | xray 45 + diagnostics 3 |
+| `flclash` | 50 | core + FlClash host 1 + feature.Android adaptation 1 |
+| `reclash` | 71 | flclash + ReClash 21 |
 
 `core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
 is what the ReClash application consumes.
+
+## mux.cool
+
+`xray/0037` ports the client from Veles/Prizrak; `xray/0048` fixes the draining-carrier close
+deadlock. The hardening patches keep that port as the wire source and fix the transport around it:
+
+| Patch | Concern |
+|---|---|
+| `0049-muxcool-downlink-backpressure` | byte/frame-bounded per-session queues; a slow TCP consumer resets only its session with `ErrSessionOverflow`; UDP drops are counted; pooled buffers are released on overflow/reset/close; End never blocks the read loop |
+| `0050-muxcool-write-deadlines` | deadline-aware carrier write turn; 30 s whole-frame write timeout closes a stalled carrier; `WriteTo` honors its deadline across the turn and the physical write |
+| `0051-muxcool-pool-lifecycle` | the carrier dial belongs to the pool, not the caller; waiters of a failed dial share its error; exponential failure backoff; idle carriers of another pool are reclaimed under limiter pressure |
+| `0052-muxcool-xray-modes` | Xray aliases `concurrency`, `xudpConcurrency`, `xudpProxyUDP443`; TCP-only, UDP-only and Vision+XUDP-only modes; a no-pool block is ignored with a warning |
+| `0053-muxcool-diagnostics` | `Pool.Stats` / `MuxCool.Stats` counters without hot-path logging or a ReClash dependency |
+| `0054-muxcool-protocol-hardening` | server-initiated New is ignored; the uncontended write turn avoids a per-frame timer; fuzz targets, protocol edge tests and benchmarks |
+| `0055-muxcool-xray-interop` | real Xray-core interop suite, pinned and run in CI |
+| `0056-muxcool-expired-write-deadline` | an already-expired caller deadline is rejected after taking the write turn without closing the carrier |
+
+### Compatibility
+
+| Feature | Status |
+|---|---|
+| TCP mux | supported; default `max-concurrency` 8, `max-connections` 128 |
+| XUDP, shared pool | `xudp-concurrency: 0` (the historical meaning, same as Xray) |
+| XUDP, separate pool | `xudp-concurrency: > 0` |
+| TCP-only | `concurrency: 0` with no XUDP pool means no mux at all; with an XUDP pool it means UDP-only |
+| UDP-only | `concurrency: 0`, `xudp-concurrency: > 0`; interop-tested |
+| Vision + UDP-only mux | allowed; TCP stays plain Vision, the carrier carries only UDP; interop-tested |
+| Vision + TCP mux | rejected; Xray breaks such carriers and the parser keeps that rule |
+| `xudp-proxy-udp443` | `reject` (default), `allow`, `skip`; the outer mihomo `udp-443: reject` still wins when set |
+| GlobalID | derived from `SrcIP:SrcPort`; zero when the source is invalid, which Xray treats as plain UDP |
+| IPv4, IPv6, domains | codec golden vectors and unit tests; interop covers IPv4 and domains |
+| VLESS transports | mux sits above the transport; interop covers plain TCP and TLS 1.3, unit tests cover REALITY/XHTTP/WS construction |
+| XDRIVE, smux | mux.cool over XDRIVE and smux together are rejected, as before |
+
+### Limits
+
+- One carrier is one physical TCP connection. Transport-level head-of-line blocking cannot be
+  removed by the client without changing the wire protocol.
+- Mux.Cool has no per-stream window. A TCP consumer more than 256 KiB behind is reset with
+  `ErrSessionOverflow` instead of stalling every sibling; the caller sees the error, and TCP data
+  is never silently dropped or reordered. The carrier-wide budget defaults to 4 MiB.
+- UDP overflow drops the datagram (the protocol's lossy mode) and increments the drop counter.
+- The carrier write timeout and buffer budgets are core API options with defaults; they are not
+  YAML keys, so existing profiles keep their meaning.
+- The interop suite pins Xray 26.11.9. The framing has been stable, but a new Xray release needs a
+  re-run of `tool/xray_interop.sh` before claiming compatibility.
+
+### Performance
+
+Measured on a Ryzen 5 7500F (linux/amd64, Go 1.27.2), `-benchmem -benchtime 500ms -count=3`, the
+pre-hardening core profile (through `0048`) against the hardened tree. Absolute numbers are
+microbenchmarks; the deltas are the relevant part:
+
+| Benchmark | Before | After |
+|---|---|---|
+| encode 8 KiB Keep/Data | 551 ns, 1 alloc | 548 ns, 1 alloc |
+| decode 8 KiB Keep/Data | 896 ns, 4 allocs | 910 ns, 4 allocs |
+| carrier frame write, uncontended | 71–77 ns, 0 allocs | 92–105 ns, 0 allocs |
+| carrier frame write, 30 s deadline | n/a | 122–135 ns, 0 allocs |
+| pool dial + close | 1.46 µs, 21 allocs | 1.6–1.9 µs, 26 allocs |
+| stream write 8 KiB | 678 ns, 0 allocs | 822–866 ns, 0 allocs |
+
+The codec is unchanged. The per-frame write adds the deadline-aware turn (~25 ns); the per-session
+path adds the bounded queue and the asynchronous End (~0.3 µs, five allocations per session, not
+per byte). No hot path gained an allocation.
 
 ### ReClash layer
 

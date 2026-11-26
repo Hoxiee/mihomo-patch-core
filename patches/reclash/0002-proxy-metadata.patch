@@ -2,6 +2,8 @@ rain-core: reclash/0002-proxy-metadata
 Source: Hoxiee/mihomo 5635c762 (GPL-3.0), split from the ReClash core fork.
 
 diff --git a/adapter/adapter.go b/adapter/adapter.go
+
+diff --git a/adapter/adapter.go b/adapter/adapter.go
 index 9cd4fa0..d763c35 100644
 --- a/adapter/adapter.go
 +++ b/adapter/adapter.go
@@ -447,7 +449,7 @@ index deca249..d446a2e 100644
  			Interface:    option.Interface,
  			RoutingMark:  option.RoutingMark,
 diff --git a/adapter/parser.go b/adapter/parser.go
-index 0138210..0791a7b 100644
+index 3ec8343..1f91fd2 100644
 --- a/adapter/parser.go
 +++ b/adapter/parser.go
 @@ -1,6 +1,8 @@
@@ -457,9 +459,9 @@ index 0138210..0791a7b 100644
 +	"crypto/sha256"
 +	"encoding/hex"
  	"fmt"
+ 	"strconv"
  	"strings"
- 
-@@ -48,6 +50,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -49,6 +51,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  		DialerForAPI: opt.DialerForAPI,
  		TunnelForAPI: opt.TunnelForAPI,
  		ProviderName: opt.ProviderName,
@@ -467,7 +469,7 @@ index 0138210..0791a7b 100644
  	}
  
  	var (
-@@ -288,7 +291,65 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+@@ -289,7 +292,65 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
  	}
  
  	proxy = outbound.NewAutoCloseProxyAdapter(proxy)

@@ -36,6 +36,14 @@ xray/0045-share-link-xray-params.patch
 xray/0046-trojan-reality-share-links.patch
 xray/0047-reality-mlkem-first.patch
 xray/0048-muxcool-drain-close.patch
+xray/0049-muxcool-downlink-backpressure.patch
+xray/0050-muxcool-write-deadlines.patch
+xray/0051-muxcool-pool-lifecycle.patch
+xray/0052-muxcool-xray-modes.patch
+xray/0053-muxcool-diagnostics.patch
+xray/0054-muxcool-protocol-hardening.patch
+xray/0055-muxcool-xray-interop.patch
+xray/0056-muxcool-expired-write-deadline.patch
 diagnostics/0001-probe-error-details.patch
 diagnostics/0002-proxy-transfer-test.patch
 diagnostics/0003-proxy-transfer-export.patch

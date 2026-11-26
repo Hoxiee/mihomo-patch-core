@@ -19,3 +19,14 @@ jobs:
           cache: false
       - name: Apply the profile and test the patched packages
         run: ./tool/test.sh --profile ${{ matrix.profile }}
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: mux.cool interop against pinned Xray-core
+        run: ./tool/xray_interop.sh

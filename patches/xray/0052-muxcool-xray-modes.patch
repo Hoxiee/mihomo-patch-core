@@ -1,0 +1,413 @@
+rain-core: xray/0052-muxcool-xray-modes
+Source: ReClash fix on top of xray/0037 (GPL-3.0).
+
+Xray spells the mux options concurrency, xudpConcurrency and
+xudpProxyUDP443, and concurrency: 0 means "no TCP pool" rather than "use the
+default". Accept those aliases without changing the historical kebab keys:
+an explicit alias wins, an absent one leaves max-concurrency: 0 at its old
+meaning. A TCP-disabled block with an XUDP pool is Xray's UDP-only mux, which
+is also the one Vision combination Xray allows (the server restricts a Vision
+Mux carrier to UDP); TCP then goes over plain VLESS with Vision and only UDP
+is multiplexed. A block with no pool left is ignored with a warning.
+
+Tests: parser alias/TCP-disabled/Vision tests, outbound TCP-disabled and
+no-pool tests.
+diff --git a/adapter/outbound/muxcool.go b/adapter/outbound/muxcool.go
+index 1a5beac..c41c3f4 100644
+--- a/adapter/outbound/muxcool.go
++++ b/adapter/outbound/muxcool.go
+@@ -31,6 +31,11 @@ var ErrMuxCoolUDP443Rejected = errors.New("mux.cool rejected UDP/443 traffic")
+ // separate pool of that width for UDP, 0 = UDP shares the TCP pool;
+ // xudp-proxy-udp443: reject (default, QUIC falls back to TCP), allow (UDP/443
+ // rides the mux) or skip (UDP/443 goes over plain VLESS).
++//
++// The Xray spellings concurrency, xudpConcurrency and xudpProxyUDP443 are
++// aliases applied by the parser. `concurrency: 0` disables TCP muxing while
++// leaving XUDP on its own pool, which is Xray's "Vision with XUDP only" mode;
++// an absent or positive max-concurrency keeps the historical default.
+ type MuxCoolOption struct {
+ 	Enabled         bool   `proxy:"enabled,omitempty"`
+ 	MaxConcurrency  int    `proxy:"max-concurrency,omitempty"`
+@@ -38,6 +43,9 @@ type MuxCoolOption struct {
+ 	MaxCarriers     int    `proxy:"max-carriers,omitempty"`
+ 	XUDPConcurrency int    `proxy:"xudp-concurrency,omitempty"`
+ 	XUDPProxyUDP443 string `proxy:"xudp-proxy-udp443,omitempty"`
++	// TCPDisabled comes only from the Xray `concurrency: 0` alias; the
++	// decoder ignores it so the historical kebab keys keep their meaning.
++	TCPDisabled bool `proxy:"-"`
+ }
+ 
+ // MuxCool carries the TCP and UDP of a vless proxy as Mux.Cool sessions over
+@@ -71,19 +79,26 @@ func NewMuxCool(option MuxCoolOption, proxy ProxyAdapter) (ProxyAdapter, error)
+ 	default:
+ 		return nil, fmt.Errorf("mux.cool xudp-proxy-udp443 must be reject, allow, or skip")
+ 	}
+-	if option.MaxConcurrency == 0 {
++	if option.MaxConcurrency == 0 && !option.TCPDisabled {
+ 		option.MaxConcurrency = muxcool.DefaultMaxConcurrency
+ 	}
+ 	if option.MaxConnections == 0 {
+ 		option.MaxConnections = muxcool.DefaultMaxConnections
+ 	}
++	if option.TCPDisabled && option.XUDPConcurrency == 0 {
++		// Nothing is multiplexed: TCP is off by the Xray alias and UDP has
++		// no pool of its own.
++		return proxy, nil
++	}
+ 
+ 	wrapper := &MuxCool{ProxyAdapter: proxy, option: option}
+ 	var limiter *muxcool.CarrierLimiter
+ 	if option.MaxCarriers > 0 {
+ 		limiter = muxcool.NewCarrierLimiter(option.MaxCarriers)
+ 	}
+-	wrapper.pool = wrapper.newPool(option.MaxConcurrency, limiter)
++	if !option.TCPDisabled {
++		wrapper.pool = wrapper.newPool(option.MaxConcurrency, limiter)
++	}
+ 	if option.XUDPConcurrency > 0 {
+ 		wrapper.xudpPool = wrapper.newPool(option.XUDPConcurrency, limiter)
+ 	}
+@@ -124,7 +139,7 @@ func (x *MuxCool) dialCarrier(ctx context.Context) (net.Conn, error) {
+ }
+ 
+ func (x *MuxCool) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+-	if metadata.NetWork != C.TCP {
++	if metadata.NetWork != C.TCP || x.pool == nil {
+ 		return x.ProxyAdapter.DialContext(ctx, metadata)
+ 	}
+ 	conn, err := x.pool.DialContext(ctx, metadata.String(), metadata.DstPort)
+@@ -148,9 +163,12 @@ func (x *MuxCool) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ 	if metadata.SourceValid() {
+ 		globalID = utils.GlobalID(metadata.SourceAddress())
+ 	}
+-	pool := x.pool
+-	if x.xudpPool != nil {
+-		pool = x.xudpPool
++	pool := x.xudpPool
++	if pool == nil {
++		pool = x.pool
++	}
++	if pool == nil {
++		return x.ProxyAdapter.ListenPacketContext(ctx, metadata)
+ 	}
+ 	packetConn, err := pool.ListenPacketContext(ctx, metadata.String(), metadata.DstPort, globalID)
+ 	if err != nil {
+@@ -171,7 +189,7 @@ func (x *MuxCool) SupportUOT() bool {
+ 
+ func (x *MuxCool) ProxyInfo() C.ProxyInfo {
+ 	info := x.ProxyAdapter.ProxyInfo()
+-	info.XUDP = true
++	info.XUDP = x.xudpPool != nil || x.pool != nil
+ 	return info
+ }
+ 
+@@ -180,7 +198,9 @@ func (x *MuxCool) Close() error {
+ 		if x.xudpPool != nil {
+ 			_ = x.xudpPool.Close()
+ 		}
+-		_ = x.pool.Close()
++		if x.pool != nil {
++			_ = x.pool.Close()
++		}
+ 		x.closeErr = x.ProxyAdapter.Close()
+ 	})
+ 	return x.closeErr
+diff --git a/adapter/outbound/muxcool_test.go b/adapter/outbound/muxcool_test.go
+index b04b4d1..00db14a 100644
+--- a/adapter/outbound/muxcool_test.go
++++ b/adapter/outbound/muxcool_test.go
+@@ -655,3 +655,75 @@ func TestMuxCoolCloseClosesDedicatedXUDPPoolBeforeBase(t *testing.T) {
+ 		t.Fatalf("close events = %v, want both carriers before base", events)
+ 	}
+ }
++
++func TestMuxCoolTCPDisabledDelegatesTCPAndPoolsUDP(t *testing.T) {
++	base := newFakeMuxCoolAdapter()
++	wrapped, err := NewMuxCool(MuxCoolOption{Enabled: true, TCPDisabled: true, XUDPConcurrency: 2}, base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = wrapped.Close() })
++
++	stream, err := wrapped.DialContext(context.Background(), &C.Metadata{NetWork: C.TCP, Host: "plain.example", DstPort: 443})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = stream.Close() })
++	base.mu.Lock()
++	tcpMetadata := base.dialMetadata[0]
++	base.mu.Unlock()
++	if tcpMetadata.Host != "plain.example" || tcpMetadata.DstPort != 443 {
++		t.Fatalf("TCP dial metadata = %+v, want the real target", tcpMetadata)
++	}
++	server := <-base.carrierServers
++	_ = server.Close()
++
++	metadata := &C.Metadata{
++		NetWork: C.UDP, Host: "dns.example", DstPort: 53,
++		SrcIP: netip.MustParseAddr("192.0.2.10"), SrcPort: 4242,
++	}
++	packetConn, err := wrapped.ListenPacketContext(context.Background(), metadata)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = packetConn.Close() })
++	carrierServer := <-base.carrierServers
++	t.Cleanup(func() { _ = carrierServer.Close() })
++
++	base.mu.Lock()
++	carrierMetadata := base.dialMetadata[1]
++	base.mu.Unlock()
++	if carrierMetadata.Host != muxCoolDestination || carrierMetadata.DstPort != muxCoolPort {
++		t.Fatalf("UDP carrier metadata = %+v", carrierMetadata)
++	}
++
++	writeDone := make(chan error, 1)
++	go func() {
++		_, err := packetConn.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.MustParseAddrPort("8.8.8.8:53")))
++		writeDone <- err
++	}()
++	frame, err := muxcool.DecodeFrame(carrierServer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := <-writeDone; err != nil {
++		t.Fatal(err)
++	}
++	if frame.Status != muxcool.StatusNew || frame.Network != muxcool.NetworkUDP || string(frame.Payload) != "query" {
++		t.Fatalf("UDP New frame = %+v", frame)
++	}
++	if !wrapped.ProxyInfo().XUDP {
++		t.Fatal("ProxyInfo XUDP = false with an XUDP pool")
++	}
++}
++
++func TestNewMuxCoolWithoutPoolsReturnsBase(t *testing.T) {
++	base := newFakeMuxCoolAdapter()
++	got, err := NewMuxCool(MuxCoolOption{Enabled: true, TCPDisabled: true}, base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got != ProxyAdapter(base) {
++		t.Fatalf("adapter = %T, want the base adapter", got)
++	}
++}
+diff --git a/adapter/parser.go b/adapter/parser.go
+index d6f52ce..f9a574c 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -2,6 +2,7 @@ package adapter
+ 
+ import (
+ 	"fmt"
++	"strconv"
+ 	"strings"
+ 
+ 	"github.com/metacubex/mihomo/adapter/outbound"
+@@ -301,7 +302,15 @@ func wrapMuxCool(mapping, muxCoolMapping map[string]any, proxy outbound.ProxyAda
+ 	if !option.Enabled {
+ 		return proxy
+ 	}
+-	err := checkMuxCool(mapping, decoder)
++	if err := applyMuxCoolAliases(muxCoolMapping, &option); err != nil {
++		log.Warnln("[Proxy] %s: ignore mux.cool: %s", proxy.Name(), err.Error())
++		return proxy
++	}
++	if option.TCPDisabled && option.XUDPConcurrency == 0 {
++		log.Warnln("[Proxy] %s: ignore mux.cool: concurrency 0 leaves no pool (set xudp-concurrency for UDP-only muxing)", proxy.Name())
++		return proxy
++	}
++	err := checkMuxCool(mapping, decoder, option)
+ 	var wrapped outbound.ProxyAdapter
+ 	if err == nil {
+ 		wrapped, err = outbound.NewMuxCool(option, proxy)
+@@ -313,7 +322,68 @@ func wrapMuxCool(mapping, muxCoolMapping map[string]any, proxy outbound.ProxyAda
+ 	return wrapped
+ }
+ 
+-func checkMuxCool(mapping map[string]any, decoder *structure.Decoder) error {
++// applyMuxCoolAliases maps Xray's camelCase mux keys onto the kebab options
++// Veles configs use. An explicit Xray key wins; absent keys leave the
++// historical meaning untouched. `concurrency: 0` is Xray's "no TCP pool",
++// which is also the only form that may carry XUDP under a Vision flow.
++func applyMuxCoolAliases(mapping map[string]any, option *outbound.MuxCoolOption) error {
++	if value, ok := mapping["concurrency"]; ok {
++		concurrency, err := muxCoolInt(value)
++		if err != nil {
++			return fmt.Errorf("concurrency: %w", err)
++		}
++		if concurrency < 0 {
++			return fmt.Errorf("concurrency must not be negative")
++		}
++		if concurrency == 0 {
++			option.TCPDisabled = true
++		} else {
++			option.MaxConcurrency = concurrency
++		}
++	}
++	if value, ok := mapping["xudpConcurrency"]; ok {
++		concurrency, err := muxCoolInt(value)
++		if err != nil {
++			return fmt.Errorf("xudpConcurrency: %w", err)
++		}
++		if concurrency < 0 {
++			return fmt.Errorf("xudpConcurrency must not be negative")
++		}
++		option.XUDPConcurrency = concurrency
++	}
++	if value, ok := mapping["xudpProxyUDP443"]; ok {
++		policy, ok := value.(string)
++		if !ok {
++			return fmt.Errorf("xudpProxyUDP443 must be a string")
++		}
++		option.XUDPProxyUDP443 = policy
++	}
++	return nil
++}
++
++func muxCoolInt(value any) (int, error) {
++	switch typed := value.(type) {
++	case int:
++		return typed, nil
++	case int64:
++		return int(typed), nil
++	case float64:
++		if typed != float64(int(typed)) {
++			return 0, fmt.Errorf("not an integer: %v", typed)
++		}
++		return int(typed), nil
++	case string:
++		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
++		if err != nil {
++			return 0, fmt.Errorf("not an integer: %q", typed)
++		}
++		return parsed, nil
++	default:
++		return 0, fmt.Errorf("not an integer: %T", value)
++	}
++}
++
++func checkMuxCool(mapping map[string]any, decoder *structure.Decoder, option outbound.MuxCoolOption) error {
+ 	if proxyType := mapping["type"]; proxyType != "vless" {
+ 		// Only the VLESS outbound turns the carrier dial into the Mux command.
+ 		return fmt.Errorf("mux.cool is only supported for vless proxies, not %v", proxyType)
+@@ -321,10 +391,12 @@ func checkMuxCool(mapping map[string]any, decoder *structure.Decoder) error {
+ 	if mapping["network"] == "xdrive" {
+ 		return fmt.Errorf("xdrive already carries Mux.Cool and cannot be wrapped in mux.cool")
+ 	}
+-	if flow, _ := mapping["flow"].(string); strings.HasPrefix(flow, vless.XRV) {
++	if flow, _ := mapping["flow"].(string); strings.HasPrefix(flow, vless.XRV) && !option.TCPDisabled {
+ 		// Vision splices the inner TLS of one TCP connection, a carrier holds
+-		// many sessions: Xray rejects mux with Vision for TCP.
+-		return fmt.Errorf("mux.cool cannot be used with VLESS flow %s: disable mux.cool or remove flow", flow)
++		// many sessions: Xray rejects mux with Vision for TCP. Xray does allow
++		// a Mux carrier that carries only XUDP under Vision, which is what
++		// concurrency: 0 plus an XUDP pool expresses.
++		return fmt.Errorf("mux.cool cannot be used with VLESS flow %s while TCP muxing is enabled: set concurrency: 0 or remove flow", flow)
+ 	}
+ 	if smuxMapping, ok := mapping["smux"].(map[string]any); ok {
+ 		smux := outbound.SingMuxOption{}
+diff --git a/adapter/parser_muxcool_test.go b/adapter/parser_muxcool_test.go
+index c2db0e0..9026053 100644
+--- a/adapter/parser_muxcool_test.go
++++ b/adapter/parser_muxcool_test.go
+@@ -20,6 +20,7 @@ func TestParseProxyMuxCoolConfigurations(t *testing.T) {
+ 		wantMaxCarriers         int
+ 		wantXUDPConcurrency     int
+ 		wantXUDPProxyUDP443Mode string
++		wantTCPDisabled         bool
+ 	}{
+ 		{name: "omitted"},
+ 		{name: "disabled", muxCool: map[string]any{"enabled": false}},
+@@ -36,6 +37,30 @@ func TestParseProxyMuxCoolConfigurations(t *testing.T) {
+ 			wantWrapped: true, wantMaxConcurrency: 3, wantMaxConnections: 19,
+ 			wantMaxCarriers: 2, wantXUDPConcurrency: 4, wantXUDPProxyUDP443Mode: "allow",
+ 		},
++		{
++			name: "xray aliases",
++			muxCool: map[string]any{
++				"enabled": true, "concurrency": 3, "xudpConcurrency": 5, "xudpProxyUDP443": "skip",
++			},
++			wantWrapped: true, wantMaxConcurrency: 3, wantMaxConnections: 128,
++			wantXUDPConcurrency: 5, wantXUDPProxyUDP443Mode: "skip",
++		},
++		{
++			name: "xray alias overrides kebab",
++			muxCool: map[string]any{
++				"enabled": true, "max-concurrency": 2, "concurrency": 6,
++			},
++			wantWrapped: true, wantMaxConcurrency: 6, wantMaxConnections: 128,
++			wantXUDPProxyUDP443Mode: "reject",
++		},
++		{
++			name: "tcp disabled with xudp pool",
++			muxCool: map[string]any{
++				"enabled": true, "concurrency": 0, "xudpConcurrency": 4,
++			},
++			wantWrapped: true, wantTCPDisabled: true, wantMaxConnections: 128,
++			wantXUDPConcurrency: 4, wantXUDPProxyUDP443Mode: "reject",
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -60,7 +85,8 @@ func TestParseProxyMuxCoolConfigurations(t *testing.T) {
+ 					options.MaxConnections != tt.wantMaxConnections ||
+ 					options.MaxCarriers != tt.wantMaxCarriers ||
+ 					options.XUDPConcurrency != tt.wantXUDPConcurrency ||
+-					options.XUDPProxyUDP443 != tt.wantXUDPProxyUDP443Mode {
++					options.XUDPProxyUDP443 != tt.wantXUDPProxyUDP443Mode ||
++					options.TCPDisabled != tt.wantTCPDisabled {
+ 					t.Fatalf("options = %+v", options)
+ 				}
+ 			}
+@@ -101,6 +127,21 @@ func TestParseProxyIgnoresInvalidMuxCoolConfigurations(t *testing.T) {
+ 			mapping: vlessMapping(map[string]any{"mux.cool": map[string]any{"enabled": true, "xudp-proxy-udp443": "drop"}}),
+ 			match:   "xudp-proxy-udp443",
+ 		},
++		{
++			name:    "negative xray concurrency",
++			mapping: vlessMapping(map[string]any{"mux.cool": map[string]any{"enabled": true, "concurrency": -1}}),
++			match:   "concurrency",
++		},
++		{
++			name:    "non-integer xray concurrency",
++			mapping: vlessMapping(map[string]any{"mux.cool": map[string]any{"enabled": true, "concurrency": "many"}}),
++			match:   "concurrency",
++		},
++		{
++			name:    "no pool after tcp disabled",
++			mapping: vlessMapping(map[string]any{"mux.cool": map[string]any{"enabled": true, "concurrency": 0}}),
++			match:   "no pool",
++		},
+ 		{
+ 			name: "smux conflict",
+ 			mapping: vlessMapping(map[string]any{
+@@ -181,6 +222,28 @@ func TestParseProxyIgnoresMuxCoolWithVLESSVision(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseProxyAllowsVisionWithUDPOnlyMuxCool(t *testing.T) {
++	mapping := vlessMapping(map[string]any{
++		"flow": "xtls-rprx-vision",
++		"mux.cool": map[string]any{
++			"enabled": true, "concurrency": 0, "xudpConcurrency": 4,
++		},
++	})
++	parsed, err := ParseProxy(mapping)
++	if err != nil {
++		t.Fatalf("ParseProxy: %v", err)
++	}
++	defer parsed.Close()
++	muxCool, ok := unwrapAutoClose(t, parsed.Adapter()).(*outbound.MuxCool)
++	if !ok {
++		t.Fatalf("adapter = %T, want *outbound.MuxCool", unwrapAutoClose(t, parsed.Adapter()))
++	}
++	options := muxCool.Options()
++	if !options.TCPDisabled || options.XUDPConcurrency != 4 {
++		t.Fatalf("options = %+v, want UDP-only mux", options)
++	}
++}
++
+ func TestParseProxyVLESSMuxCoolWrapping(t *testing.T) {
+ 	tests := []struct {
+ 		name        string
