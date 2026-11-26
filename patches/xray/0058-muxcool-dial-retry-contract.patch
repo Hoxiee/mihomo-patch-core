@@ -1,0 +1,156 @@
+rain-core: xray/0058-muxcool-dial-retry-contract
+Source: ReClash test fix on top of xray/0051 and xray/0057 (GPL-3.0).
+
+Three mux.cool tests still assumed that the initiating DialContext always
+observes the first carrier dial error. 0051 intentionally retries the first
+dial failure immediately (dialBackoff returns zero for the first failure), so
+when runDial clears p.dialing before the caller re-enters openContext the
+pool performs that retry itself and the caller can succeed transparently.
+The old assertions flaked under a loaded race loop: roughly 1/67 for
+TestPoolDoesNotRetainFailedCarrierDial, 1/95 for
+TestCarrierLimiterReleasesFailedDialReservation and 1/107 for
+TestPoolStatsCountsDialFailures.
+
+The tests now follow the 0051 contract without weakening the invariants:
+
+- TestPoolDoesNotRetainFailedCarrierDial accepts the error or the
+  transparent success, and still requires exactly two dialer calls, one
+  recorded dial failure, no worker for the failed dial and the one
+  successful carrier.
+- TestCarrierLimiterReleasesFailedDialReservation accepts either outcome and
+  still requires the released limiter slot to carry the next successful
+  dial after exactly two dialer calls.
+- TestPoolStatsCountsDialFailures counts the dials the inline dialer
+  actually performed (one or two) and requires Stats().DialFailures to match
+  that count with no pending opens.
+
+Test-only: 0051's production semantics are unchanged.
+
+Tests: TestPoolDoesNotRetainFailedCarrierDial,
+TestCarrierLimiterReleasesFailedDialReservation,
+TestPoolStatsCountsDialFailures.
+diff --git a/transport/muxcool/pool_test.go b/transport/muxcool/pool_test.go
+index 8ec3708..5150c84 100644
+--- a/transport/muxcool/pool_test.go
++++ b/transport/muxcool/pool_test.go
+@@ -233,14 +233,25 @@ func TestCarrierLimiterReleasesFailedDialReservation(t *testing.T) {
+ 	pool := NewPool(dialer.dial, options)
+ 	t.Cleanup(func() { _ = pool.Close() })
+ 
+-	if _, err := pool.DialContext(context.Background(), "failure.example", 80); !errors.Is(err, dialErr) {
+-		t.Fatalf("first dial error = %v", err)
+-	}
+-	conn, err := pool.DialContext(context.Background(), "success.example", 80)
+-	if err != nil {
+-		t.Fatalf("second dial: %v", err)
++	// 0051 retries the first carrier dial failure immediately, so this
++	// DialContext either observes dialErr or succeeds transparently when the
++	// retry wins the race. Either way the limiter slot the failed dial took
++	// must be free again and the next successful carrier must exist after
++	// exactly two dials.
++	first, firstErr := pool.DialContext(context.Background(), "failure.example", 80)
++	if firstErr != nil {
++		if !errors.Is(firstErr, dialErr) {
++			t.Fatalf("first dial error = %v, want %v", firstErr, dialErr)
++		}
++		conn, err := pool.DialContext(context.Background(), "success.example", 80)
++		if err != nil {
++			t.Fatalf("second dial: %v", err)
++		}
++		defer func() { _ = conn.Close() }()
++	} else {
++		// The immediate retry won the race and the caller never saw dialErr.
++		defer func() { _ = first.Close() }()
+ 	}
+-	defer conn.Close()
+ 	if got := dialer.callCount(); got != 2 {
+ 		t.Fatalf("carrier dials = %d, want 2", got)
+ 	}
+@@ -583,17 +594,40 @@ func TestPoolDoesNotRetainFailedCarrierDial(t *testing.T) {
+ 	pool := NewPool(dialer.dial, testPoolOptions())
+ 	t.Cleanup(func() { _ = pool.Close() })
+ 
+-	if _, err := pool.DialContext(context.Background(), "failure.example", 80); !errors.Is(err, dialErr) {
+-		t.Fatalf("first dial error = %v", err)
+-	}
+-	conn, err := pool.DialContext(context.Background(), "success.example", 80)
+-	if err != nil {
+-		t.Fatalf("second dial: %v", err)
++	// 0051 retries the first carrier dial failure immediately (dialBackoff
++	// returns zero for the first failure), and that retry belongs to the pool.
++	// The initiating caller therefore has two valid outcomes: it observes
++	// dialErr through the shared dial result, or runDial finished the retry
++	// before the caller re-entered openContext and the dial succeeded
++	// transparently. Both paths must leave no worker behind for the failed
++	// dial.
++	first, firstErr := pool.DialContext(context.Background(), "failure.example", 80)
++	if firstErr != nil {
++		if !errors.Is(firstErr, dialErr) {
++			t.Fatalf("first dial error = %v, want %v", firstErr, dialErr)
++		}
++		if got := pool.workerCount(); got != 0 {
++			t.Fatalf("failed carrier dial left %d workers", got)
++		}
++		conn, err := pool.DialContext(context.Background(), "success.example", 80)
++		if err != nil {
++			t.Fatalf("second dial: %v", err)
++		}
++		_ = conn.Close()
++	} else {
++		// The immediate retry won the race and the caller never saw dialErr.
++		_ = first.Close()
+ 	}
+-	_ = conn.Close()
+ 	if got := dialer.callCount(); got != 2 {
+ 		t.Fatalf("carrier dials = %d, want 2", got)
+ 	}
++	if got := pool.Stats().DialFailures; got != 1 {
++		t.Fatalf("dial failures = %d, want 1", got)
++	}
++	waitFor(t, func() bool { return pool.activeSessions() == 0 })
++	if got := pool.workerCount(); got != 1 {
++		t.Fatalf("workers = %d, want the one successful carrier", got)
++	}
+ }
+ 
+ func TestPoolCloseDoesNotWaitForCarrierDial(t *testing.T) {
+diff --git a/transport/muxcool/stats_test.go b/transport/muxcool/stats_test.go
+index 83612d2..b844155 100644
+--- a/transport/muxcool/stats_test.go
++++ b/transport/muxcool/stats_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"net"
++	"sync/atomic"
+ 	"testing"
+ )
+ 
+@@ -78,7 +79,9 @@ func TestPoolStatsReportsSessionsQueuesAndDrops(t *testing.T) {
+ }
+ 
+ func TestPoolStatsCountsDialFailures(t *testing.T) {
++	var calls atomic.Int64
+ 	pool := NewPool(func(context.Context) (net.Conn, error) {
++		calls.Add(1)
+ 		return nil, errTestDial
+ 	}, testPoolOptions())
+ 	t.Cleanup(func() { _ = pool.Close() })
+@@ -86,8 +89,15 @@ func TestPoolStatsCountsDialFailures(t *testing.T) {
+ 	if _, err := pool.DialContext(context.Background(), "fail.example", 80); err == nil {
+ 		t.Fatal("dial succeeded")
+ 	}
+-	if got := pool.Stats().DialFailures; got != 1 {
+-		t.Fatalf("dial failures = %d, want 1", got)
++	// 0051 retries the first carrier dial failure immediately, so one
++	// DialContext may perform one or two physical dials. The counter must
++	// follow the dials actually attempted, not a hard-coded single failure.
++	attempts := calls.Load()
++	if attempts < 1 || attempts > 2 {
++		t.Fatalf("carrier dials = %d, want 1 or 2", attempts)
++	}
++	if got := pool.Stats().DialFailures; got != uint64(attempts) {
++		t.Fatalf("dial failures = %d, want %d", got, attempts)
+ 	}
+ 	if got := pool.Stats().PendingOpens; got != 0 {
+ 		t.Fatalf("pending opens = %d, want 0", got)

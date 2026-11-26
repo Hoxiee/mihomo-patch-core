@@ -27,7 +27,8 @@ Two defects found and fixed:
    decoded and queued for a slow TCP consumer: session.closeCarrier closed
    the session immediately. A carrier FIN now queues the EOF behind the
    queued payload and lets runDownlink finish after the last write; resets
-   and protocol errors keep the reset path. UDP already drained.
+   and protocol errors keep the reset path. UDP stays lossy: queued datagrams
+   are dropped on carrier close.
 2. A carrier whose frame write had failed kept reporting itself available
    until the asynchronous close ran, so Pool.DialContext could return a
    session that was dead before its first byte. fail() now marks the worker

@@ -132,9 +132,9 @@ the documented errors, and the goroutine count must return to its pre-run baseli
 
 | Profile | Patches | Contents |
 |---|---:|---|
-| `core` | 49 | xray 46 + diagnostics 3 |
-| `flclash` | 51 | core + FlClash host 1 + feature.Android adaptation 1 |
-| `reclash` | 72 | flclash + ReClash 21 |
+| `core` | 50 | xray 47 + diagnostics 3 |
+| `flclash` | 52 | core + FlClash host 1 + feature.Android adaptation 1 |
+| `reclash` | 73 | flclash + ReClash 21 |
 
 `core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
 is what the ReClash application consumes.
@@ -155,6 +155,7 @@ deadlock. The hardening patches keep that port as the wire source and fix the tr
 | `0055-muxcool-xray-interop` | real Xray-core interop suite, pinned and run in CI |
 | `0056-muxcool-expired-write-deadline` | an already-expired caller deadline is rejected after taking the write turn without closing the carrier |
 | `0057-muxcool-soak-fault-injection` | fault-injecting carrier (latency, jitter, token bucket, stalls, short/partial writes), deterministic TCP and UDP fault matrix, goroutine-leak check, opt-in soak; fixes a clean-EOF payload drop and a failed carrier still accepting sessions |
+| `0058-muxcool-dial-retry-contract` | the failed-dial tests follow the 0051 immediate first retry: the caller may observe the error or the transparent success, with exactly two dials, dial-failure stats matching the attempted dials and the limiter slot released |
 
 ### Compatibility
 
