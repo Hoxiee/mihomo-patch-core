@@ -1,6 +1,9 @@
 mihomo-patch-core: xray/0012-tcp-connect-timeout
 Source: ClashFest core patch 0012 (GPL-3.0), ported to the core series.
 
+A value outside 100-600000 ms is clamped with a warning rather than failing
+the whole profile, as ClashFest patch 0040 does for other proxy options.
+
 diff --git a/config/config.go b/config/config.go
 index cc8c101..5e4de37 100644
 --- a/config/config.go
@@ -29,12 +32,17 @@ index cc8c101..5e4de37 100644
  		FindProcessMode:   process.FindProcessStrict,
  		GlobalUA:          "clash.meta/" + C.Version,
  		ETagSupport:       true,
-@@ -762,6 +765,9 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+@@ -762,6 +765,14 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
  	if cfg.GlobalClientFingerprint != "" {
  		log.Errorln("The `global-client-fingerprint` configuration is removed, please set `client-fingerprint` directly on the proxy instead")
  	}
 +	if err := T.ValidateTCPConnectTimeout(cfg.TCPConnectTimeout); err != nil {
-+		return nil, fmt.Errorf("invalid tcp-connect-timeout: %w", err)
++		if cfg.TCPConnectTimeout < T.MinTCPConnectTimeout {
++			cfg.TCPConnectTimeout = T.MinTCPConnectTimeout
++		} else if cfg.TCPConnectTimeout > T.MaxTCPConnectTimeout {
++			cfg.TCPConnectTimeout = T.MaxTCPConnectTimeout
++		}
++		log.Warnln("tcp-connect-timeout: %v; using %d ms", err, cfg.TCPConnectTimeout)
 +	}
  	return &General{
  		Inbound: Inbound{
@@ -177,3 +185,43 @@ index 86dbc14..be897aa 100644
  	defer cancel()
  	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
  		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
+diff --git a/config/tcp_connect_timeout_test.go b/config/tcp_connect_timeout_test.go
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/config/tcp_connect_timeout_test.go
+@@ -0,0 +1,34 @@
++package config
++
++import (
++	"testing"
++
++	T "github.com/metacubex/mihomo/tunnel"
++)
++
++// parseGeneral clamps a tcp-connect-timeout outside the accepted range
++// instead of failing the whole profile, as ClashFest patch 0040 does for
++// other options.
++func TestTCPConnectTimeoutOutOfRangeIsClamped(t *testing.T) {
++	for _, tt := range []struct {
++		name string
++		in   int64
++		want int64
++	}{
++		{name: "below the minimum", in: 0, want: T.MinTCPConnectTimeout},
++		{name: "above the maximum", in: T.MaxTCPConnectTimeout + 1, want: T.MaxTCPConnectTimeout},
++		{name: "in range", in: 15000, want: 15000},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg := DefaultRawConfig()
++			cfg.TCPConnectTimeout = tt.in
++			general, err := parseGeneral(cfg)
++			if err != nil {
++				t.Fatalf("parseGeneral = %v", err)
++			}
++			if general.TCPConnectTimeout != tt.want {
++				t.Fatalf("tcp-connect-timeout = %d, want %d", general.TCPConnectTimeout, tt.want)
++			}
++		})
++	}
++}

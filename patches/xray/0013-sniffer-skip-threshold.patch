@@ -1,6 +1,9 @@
 mihomo-patch-core: xray/0013-sniffer-skip-threshold
 Source: ClashFest core patch 0013 (GPL-3.0), ported to the core series.
 
+A value outside -1..254 is clamped with a warning rather than failing the
+whole profile, as ClashFest patch 0040 does for other proxy options.
+
 diff --git a/component/sniffer/dispatcher.go b/component/sniffer/dispatcher.go
 index 3f5180e..73926ec 100644
 --- a/component/sniffer/dispatcher.go
@@ -184,14 +187,61 @@ index 5e4de37..244d37e 100644
  
  	Sniff map[string]RawSniffingConfig `yaml:"sniff" json:"sniff"`
  }
-@@ -1783,6 +1784,10 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
+@@ -1783,6 +1784,19 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
  		Enable:          snifferRaw.Enable,
  		ForceDnsMapping: snifferRaw.ForceDnsMapping,
  		ParsePureIp:     snifferRaw.ParsePureIp,
 +		SkipThreshold:   snifferRaw.SkipThreshold,
-+	}
-+	if t := snifferRaw.SkipThreshold; t != nil && (*t < -1 || *t > sniffer.MaxSkipThreshold) {
-+		return nil, fmt.Errorf("sniffer.skip-threshold must be -1 (never skip) or 0-%d, got %d", sniffer.MaxSkipThreshold, *t)
  	}
++	if t := snifferRaw.SkipThreshold; t != nil {
++		clamped := *t
++		if clamped > sniffer.MaxSkipThreshold {
++			clamped = sniffer.MaxSkipThreshold
++		} else if clamped < -1 {
++			clamped = -1
++		}
++		if clamped != *t {
++			log.Warnln("sniffer.skip-threshold %d is outside -1-%d; using %d", *t, sniffer.MaxSkipThreshold, clamped)
++			snifferConfig.SkipThreshold = &clamped
++		}
++	}
  	loadSniffer := make(map[snifferTypes.Type]sniffer.SnifferConfig)
  
+diff --git a/config/skip_threshold_test.go b/config/skip_threshold_test.go
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/config/skip_threshold_test.go
+@@ -0,0 +1,32 @@
++package config
++
++import (
++	"testing"
++
++	"github.com/metacubex/mihomo/component/sniffer"
++)
++
++// parseSniffer clamps an out-of-range skip-threshold instead of failing the
++// profile, as ClashFest patch 0040 does for other options.
++func TestSkipThresholdOutOfRangeIsClamped(t *testing.T) {
++	value := func(v int) *int { return &v }
++	for _, tt := range []struct {
++		name string
++		in   int
++		want int
++	}{
++		{name: "above the cap", in: sniffer.MaxSkipThreshold + 10, want: sniffer.MaxSkipThreshold},
++		{name: "below never-skip", in: -5, want: -1},
++		{name: "in range", in: 20, want: 20},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg, err := parseSniffer(RawSniffer{Enable: true, SkipThreshold: value(tt.in)}, nil)
++			if err != nil {
++				t.Fatalf("parseSniffer = %v", err)
++			}
++			if cfg.SkipThreshold == nil || *cfg.SkipThreshold != tt.want {
++				t.Fatalf("skip-threshold = %v, want %d", cfg.SkipThreshold, tt.want)
++			}
++		})
++	}
++}
