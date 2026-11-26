@@ -1,0 +1,61 @@
+mihomo-patch-core: xray/0048-muxcool-drain-close
+Source: ReClash fix on top of xray/0037 (GPL-3.0), kept apart from the ported code.
+
+A carrier that reached its lifetime is draining. Closing it hands the cause to
+every session; each session's removeSession() then finds no sessions left and
+closes again, so sync.Once.Do re-enters on the same goroutine and the close
+never returns. A network drop on a draining carrier hung it for good.
+
+Tests: TestDrainingCarrierCloseDoesNotDeadlock times out on the old condition.
+
+diff --git a/transport/muxcool/worker.go b/transport/muxcool/worker.go
+index c4c1e6a..8f2a0b7 100644
+--- a/transport/muxcool/worker.go
++++ b/transport/muxcool/worker.go
+@@ -145,7 +145,7 @@ func (w *carrierWorker) removeSession(id uint16) {
+ 	wasFull := len(w.sessions) >= w.maxActive
+ 	delete(w.sessions, id)
+ 	isIdle := len(w.sessions) == 0
+-	shouldClose := w.draining && isIdle
++	shouldClose := !w.closed && w.draining && isIdle
+ 	isAvailable := w.availableLocked()
+ 	w.mu.Unlock()
+ 	if shouldClose {
+diff --git a/transport/muxcool/drain_test.go b/transport/muxcool/drain_test.go
+new file mode 100644
+index 0000000..51f3c2d
+--- /dev/null
++++ b/transport/muxcool/drain_test.go
+@@ -0,0 +1,32 @@
++package muxcool
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++)
++
++// The first allocation reaches maxLifetime, so the carrier drains before it
++// is closed; the close must not wait on itself through removeSession.
++func TestDrainingCarrierCloseDoesNotDeadlock(t *testing.T) {
++	carrier := newTestCarrier()
++	closed := make(chan struct{})
++	var once sync.Once
++	worker := newCarrierWorker(carrier, 8, 1, func(*carrierWorker) {
++		once.Do(func() { close(closed) })
++	})
++	conn, err := worker.openSession(context.Background(), "drain.example", 80, time.Hour)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++
++	go worker.close(nil)
++
++	select {
++	case <-closed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("closing a draining carrier deadlocked")
++	}
++}

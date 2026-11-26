@@ -35,6 +35,7 @@ xray/0044-default-browser-fingerprints.patch
 xray/0045-share-link-xray-params.patch
 xray/0046-trojan-reality-share-links.patch
 xray/0047-reality-mlkem-first.patch
+xray/0048-muxcool-drain-close.patch
 diagnostics/0001-probe-error-details.patch
 diagnostics/0002-proxy-transfer-test.patch
 diagnostics/0003-proxy-transfer-export.patch

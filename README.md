@@ -95,9 +95,9 @@ ships with. Tests that need an Xray binary or external network skip themselves.
 
 | Profile | Patches | Contents |
 |---|---:|---|
-| `core` | 38 | xray 35 + diagnostics 3 |
-| `flclash` | 40 | core + FlClash host 1 + feature.Android adaptation 1 |
-| `reclash` | 59 | flclash + ReClash 19 |
+| `core` | 40 | xray 37 + diagnostics 3 |
+| `flclash` | 42 | core + FlClash host 1 + feature.Android adaptation 1 |
+| `reclash` | 63 | flclash + ReClash 21 |
 
 `core` is independently usable by any mihomo host. `flclash` keeps the FlClash contract. `reclash`
 is what the ReClash application consumes.
@@ -142,7 +142,8 @@ The former `feat: support ReClash` commit is one concern per patch:
   kept only for VLESS over XHTTP with `alpn: h3`.
 - **XHTTP** — default uplink data key, per-direction read/write deadlines, pipelined packet-up
   uploads with an 8-seq window, and the HTTP/2 flow governor (`h2-flow` / `h2-flow-control`).
-- **mux.cool** — VLESS Mux.Cool and XUDP client with carrier limits.
+- **mux.cool** — VLESS Mux.Cool and XUDP client with carrier limits; a draining carrier
+  closes without re-entering its own close.
 - **udp-443** — per-proxy and provider-override QUIC rejection.
 - **providers** — `fallback-urls` for HTTP proxy and rule providers.
 - **health checks** — `ping-config` with a destination check, sampling, and screen-aware scheduling.
